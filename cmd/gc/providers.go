@@ -671,6 +671,40 @@ func authoritativeBeadsProviderForScope(scopeRoot, cityPath string) string {
 	return resolveRawBeadsProviderForScope(scopeRoot, cityPath, true)
 }
 
+var openCityRootAltStoreFn = openAuthoritativeStoreAtForCity
+
+var cityRootAltStores = struct {
+	sync.Mutex
+	byCity map[string]beads.Store
+}{byCity: make(map[string]beads.Store)}
+
+func cityRootIsMixed(cityPath string) bool {
+	configured := rawBeadsProviderForScope(cityPath, cityPath)
+	authoritative := authoritativeBeadsProviderForScope(cityPath, cityPath)
+	return configured != authoritative
+}
+
+// cityRootAltStore opens the authoritative city-root store only when it is a
+// different provider from the configured city store. A nil store means the
+// city root has one store and callers must retain their existing path exactly.
+func cityRootAltStore(cityPath string) (beads.Store, error) {
+	if !cityRootIsMixed(cityPath) {
+		return nil, nil
+	}
+	key := filepath.Clean(cityPath)
+	cityRootAltStores.Lock()
+	defer cityRootAltStores.Unlock()
+	if store, ok := cityRootAltStores.byCity[key]; ok {
+		return store, nil
+	}
+	store, err := openCityRootAltStoreFn(cityPath, cityPath)
+	if err != nil {
+		return nil, err
+	}
+	cityRootAltStores.byCity[key] = store
+	return store, nil
+}
+
 func resolveRawBeadsProviderForScope(scopeRoot, cityPath string, authoritative bool) string {
 	runtimeCityPath := cityPath
 	if runtimeCityPath == "" {

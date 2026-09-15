@@ -118,7 +118,7 @@ func TestControlReadyFallbackRigScopeFederatesTheCityGraphBinding(t *testing.T) 
 	// binding's bead the test below proves nothing: the id would be reachable
 	// through the scope leg and a union would be indistinguishable from today.
 	seedCLIStorageRoutes(t, cityPath, nil)
-	unsplit, err := controlReadyFallbackReady(rigPath, cityPath, nil, false)
+	unsplit, err := controlReadyFallbackReady(rigPath, cityPath, nil, nil, false)
 	if err != nil {
 		t.Fatalf("premise scan: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestControlReadyFallbackRigScopeFederatesTheCityGraphBinding(t *testing.T) 
 	}
 
 	seedCLIStorageRoutes(t, cityPath, messagingSplitRoutes(binding))
-	got, err := controlReadyFallbackReady(rigPath, cityPath, nil, false)
+	got, err := controlReadyFallbackReady(rigPath, cityPath, nil, nil, false)
 	if err != nil {
 		t.Fatalf("federated scan: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestControlReadyFallbackCityScopeStillReadsOnlyTheBinding(t *testing.T) {
 	}
 	seedCLIStorageRoutes(t, cityPath, messagingSplitRoutes(binding))
 
-	got, err := controlReadyFallbackReady(cityPath, cityPath, nil, false)
+	got, err := controlReadyFallbackReady(cityPath, cityPath, nil, nil, false)
 	if err != nil {
 		t.Fatalf("city-scoped scan: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestControlReadyFallbackSingleStoreRigScopeIsUnchanged(t *testing.T) {
 	cityPath, rigPath, _ := rigFederationFixture(t, `[{"id":"ga-only-leg"}]`)
 	seedCLIStorageRoutes(t, cityPath, nil)
 
-	got, err := controlReadyFallbackReady(rigPath, cityPath, nil, false)
+	got, err := controlReadyFallbackReady(rigPath, cityPath, nil, nil, false)
 	if err != nil {
 		t.Fatalf("single-store scan: %v", err)
 	}

@@ -991,6 +991,21 @@ func warnControlGraphLegRefused(cityPath string) {
 // exactly where it resolves today and the extra leg is consulted only for ids
 // that would otherwise be a hard not-found.
 func controlBeadLedger(cityPath, storePath string, cfg *config.City, scopeStore beads.Store, beadID string) (beads.Store, beads.Bead, error) {
+	owner, bead, err := existingControlBeadLedger(cityPath, storePath, cfg, scopeStore, beadID)
+	if err == nil || !samePath(storePath, cityPath) || !errors.Is(err, beads.ErrNotFound) {
+		return owner, bead, err
+	}
+	alt, altErr := cityRootAltStore(cityPath)
+	if altErr != nil {
+		return nil, beads.Bead{}, fmt.Errorf("opening alternate city-root store for control bead %s: %w", beadID, altErr)
+	}
+	if alt == nil {
+		return nil, beads.Bead{}, err
+	}
+	return mixedCityRootControlBeadLedger(alt, beadID, err)
+}
+
+func existingControlBeadLedger(cityPath, storePath string, cfg *config.City, scopeStore beads.Store, beadID string) (beads.Store, beads.Bead, error) {
 	primary := controlGraphStore(cityPath, storePath, cfg, scopeStore)
 	bead, err := primary.Get(beadID)
 	if err == nil {
@@ -1014,6 +1029,25 @@ func controlBeadLedger(cityPath, storePath string, cfg *config.City, scopeStore 
 			beadID, storePath, controlStoreDescription(cityPath, storePath), errors.Join(err, graphErr))
 	}
 	return extra, graphBead, nil
+}
+
+func mixedCityRootControlBeadLedger(alt beads.Store, beadID string, primaryErr error) (beads.Store, beads.Bead, error) {
+	altPrefix := ""
+	altPrefixStore, _, _ := unwrapBeadPolicyStore(alt)
+	if declaring, ok := altPrefixStore.(storeref.HasIDPrefix); ok {
+		altPrefix = strings.TrimSpace(declaring.IDPrefix())
+	}
+	if altPrefix == "" {
+		return nil, beads.Bead{}, fmt.Errorf("resolving control bead %s in mixed city root: alternate authoritative city-root store declares no issue prefix", beadID)
+	}
+	if !strings.HasPrefix(beadID, altPrefix+"-") {
+		return nil, beads.Bead{}, primaryErr
+	}
+	bead, err := alt.Get(beadID)
+	if err != nil {
+		return nil, beads.Bead{}, fmt.Errorf("loading control bead %s from the alternate authoritative city-root store with prefix %q: %w", beadID, altPrefix, err)
+	}
+	return alt, bead, nil
 }
 
 // controlStoreDescription names the ledger a control-bead read actually went to,

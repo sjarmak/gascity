@@ -542,10 +542,16 @@ func buildDesiredStateWithSessionBeadsAt(
 	// rig pool can't see locally — e.g. work queued in the city store — still
 	// wakes it. Only consulted for the clamped cold-wake probe.
 	type activeStore struct {
-		store beads.Store
-		ref   string
+		store       beads.Store
+		ref         string
+		err         error
+		cityRootAlt bool
 	}
 	activeStores := []activeStore{{store: store, ref: "city"}}
+	cityAltStore, cityAltStoreErr := cityRootAltStore(cityPath)
+	if cityAltStore != nil || cityAltStoreErr != nil {
+		activeStores = append(activeStores, activeStore{store: cityAltStore, ref: "city", err: cityAltStoreErr, cityRootAlt: true})
+	}
 	for _, rig := range cfg.Rigs {
 		if suspendedRigPaths[filepath.Clean(rig.Path)] {
 			continue
@@ -653,6 +659,13 @@ func buildDesiredStateWithSessionBeadsAt(
 					namedOnDemandTemplates[template] = true
 				}
 				defaultNamedScaleTargets = append(defaultNamedScaleTargets, ownTarget)
+				if rigName == "" && !storeScopedControlDispatcher && (cityAltStore != nil || cityAltStoreErr != nil) {
+					altTarget := defaultScaleCheckTarget{template: template, storeKey: "city", store: cityAltStore, err: cityAltStoreErr}
+					if namedSessionMode != "always" {
+						defaultScaleTargets = append(defaultScaleTargets, altTarget)
+					}
+					defaultNamedScaleTargets = append(defaultNamedScaleTargets, altTarget)
+				}
 				// Cross-store demand for named-backing pools (vp-cl4): mirror the
 				// generic-pool guard (vp-s37 / #3078 below). A rig pool that backs
 				// a named session and has no custom scale_check must also probe
@@ -677,7 +690,10 @@ func buildDesiredStateWithSessionBeadsAt(
 			}
 			if store != nil && isCold && !storeScopedControlDispatcher {
 				for _, source := range activeStores {
-					target := defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref}
+					if source.cityRootAlt && rigName != "" {
+						continue
+					}
+					target := defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref, err: source.err}
 					// Mirror the generic-pool cold-wake probe below (vp-s37 /
 					// #3078): a custom scale_check that is cold and asleep
 					// cannot see routed demand, so probe every active store
@@ -719,6 +735,14 @@ func buildDesiredStateWithSessionBeadsAt(
 		if store != nil && !hasCustomScaleCheck {
 			ownTarget := ownScaleCheckTarget(cityPath, cfg, &cfg.Agents[i], store, rigStores, controlBinding, storeScopedControlDispatcher)
 			defaultScaleTargets = append(defaultScaleTargets, ownTarget)
+			if rigName == "" && !storeScopedControlDispatcher && (cityAltStore != nil || cityAltStoreErr != nil) {
+				defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTarget{
+					template: template,
+					storeKey: "city",
+					store:    cityAltStore,
+					err:      cityAltStoreErr,
+				})
+			}
 			// Cross-store demand (FR-S0.1 / vp-s37): a rig pool's routed demand
 			// may live in the city store (vp-kvp cross-store delivery), which
 			// the own-rig probe above cannot see. Add a city-store probe so the
@@ -784,7 +808,10 @@ func buildDesiredStateWithSessionBeadsAt(
 		// it itself, or the pool will churn at the warm/cold boundary.
 		if store != nil && isCold && !storeScopedControlDispatcher {
 			for _, source := range activeStores {
-				defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref})
+				if source.cityRootAlt && rigName != "" {
+					continue
+				}
+				defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTarget{template: template, store: source.store, storeKey: source.ref, err: source.err})
 			}
 			coldWakeTemplates[template] = true
 		}
@@ -1988,10 +2015,15 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 		if key == "" {
 			key = fmt.Sprintf("%p", target.store)
 		}
-		group := groups[key]
+		groupKey := key
+		group := groups[groupKey]
+		if group != nil && group.store != target.store {
+			groupKey = fmt.Sprintf("%s\x00%p", key, target.store)
+			group = groups[groupKey]
+		}
 		if group == nil {
 			group = &scaleStoreGroup{store: target.store, storeKey: key, templates: make(map[string]struct{})}
-			groups[key] = group
+			groups[groupKey] = group
 		}
 		group.templates[template] = struct{}{}
 	}
@@ -2006,7 +2038,7 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 	// probe no longer cold-gated, that double-count would be a persistent
 	// warm condition rather than a one-tick wake overshoot, so dedup by ID.
 	countedBeads := make(map[string]map[string]struct{})
-	for key, group := range groups {
+	for _, group := range groups {
 		// Ready()/CachedReady() iteration surfaces actionable work
 		// matched against gc.routed_to/gc.run_target. Formula orders that
 		// should wake pools must create an actionable root, such as a
@@ -2014,7 +2046,7 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 		// beads remain hidden by readyExcludeTypes.
 		ready, readyErr := cache.controllerDemandReady(group.store)
 		if readyErr != nil {
-			errs = append(errs, fmt.Errorf("default scale_check %s templates=%s: Ready(): %w", key, strings.Join(sortedStringSet(group.templates), ","), readyErr))
+			errs = append(errs, fmt.Errorf("default scale_check %s templates=%s: Ready(): %w", group.storeKey, strings.Join(sortedStringSet(group.templates), ","), readyErr))
 			partialTemplates = markScaleCheckPartialSet(partialTemplates, group.templates)
 			if !beads.IsPartialResult(readyErr) {
 				ready = nil

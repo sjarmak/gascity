@@ -306,13 +306,30 @@ func beadsToHookBeads(items []beads.Bead) []hookBead {
 // Every leg fails LOUD, matching `gc ready`: a work query has nowhere to say
 // "this answer is short", so a leg that errors must not degrade to a partial
 // array that reads as "no work".
-func controlReadyFallbackReady(dir, cityPath string, env map[string]string, includeEphemeral bool) ([]beads.Bead, error) {
+func controlReadyFallbackReady(dir, cityPath string, cfg *config.City, env map[string]string, includeEphemeral bool) ([]beads.Bead, error) {
 	if binding, relocated := controlGraphBinding(cityPath, dir); relocated {
 		return controlReadyBindingReady(dir, binding, includeEphemeral)
 	}
 	scoped, err := controlReadyScopeShellReady(dir, env, includeEphemeral)
 	if err != nil {
 		return nil, err
+	}
+	if samePath(dir, cityPath) {
+		alt, altErr := cityRootAltStore(cityPath)
+		if altErr != nil {
+			return nil, altErr
+		}
+		if alt != nil {
+			configured, openErr := openControlStoreAtForCity(dir, cityPath, cfg)
+			if openErr != nil {
+				return nil, openErr
+			}
+			configuredRows, readyErr := controlReadyStoreReady(dir, "configured city store", configured, includeEphemeral)
+			if readyErr != nil {
+				return nil, readyErr
+			}
+			scoped = mergeControlReadyLegs(scoped, configuredRows)
+		}
 	}
 	binding, federated := controlGraphExtraLeg(cityPath, dir)
 	if !federated {
@@ -386,13 +403,17 @@ func controlReadyScopeShellReady(dir string, env map[string]string, includeEphem
 // selector, and the limit is taken after that exclusion so the batched cap means
 // the same thing on both arms.
 func controlReadyBindingReady(dir string, binding beads.Store, includeEphemeral bool) ([]beads.Bead, error) {
+	return controlReadyStoreReady(dir, "graph binding", binding, includeEphemeral)
+}
+
+func controlReadyStoreReady(dir, description string, store beads.Store, includeEphemeral bool) ([]beads.Bead, error) {
 	tier := beads.TierIssues
 	if includeEphemeral {
 		tier = beads.TierBoth
 	}
-	ready, err := binding.Ready(beads.ReadyQuery{TierMode: tier})
+	ready, err := store.Ready(beads.ReadyQuery{TierMode: tier})
 	if err != nil {
-		return nil, fmt.Errorf("control-ready fallback: reading the graph binding for %s: %w", dir, err)
+		return nil, fmt.Errorf("control-ready fallback: reading the %s for %s: %w", description, dir, err)
 	}
 	result := make([]beads.Bead, 0, len(ready))
 	for _, bead := range ready {
@@ -401,7 +422,7 @@ func controlReadyBindingReady(dir string, binding beads.Store, includeEphemeral 
 		}
 		result = append(result, bead)
 		if len(result) == controlReadyFallbackLimit {
-			log.Printf("control-ready fallback: the graph binding for %s returned at least the %d-item limit -- city-wide ready set may be truncated, some candidates/routes could see fewer beads than are actually ready", dir, controlReadyFallbackLimit)
+			log.Printf("control-ready fallback: the %s for %s returned at least the %d-item limit -- city-wide ready set may be truncated, some candidates/routes could see fewer beads than are actually ready", description, dir, controlReadyFallbackLimit)
 			break
 		}
 	}
@@ -544,10 +565,24 @@ func controlReadyCacheSources(dir, cityPath string, cfg *config.City) (sources, 
 	if err != nil {
 		return nil, nil, err
 	}
-	if binding, federated := controlGraphExtraLeg(cityPath, dir); federated {
-		return []beads.Store{scoped, binding}, []beads.Store{scoped}, nil
+	sources = []beads.Store{scoped}
+	owned = []beads.Store{scoped}
+	if samePath(dir, cityPath) {
+		alt, altErr := cityRootAltStore(cityPath)
+		if altErr != nil {
+			if closeErr := closeBeadStoreHandle(scoped); closeErr != nil {
+				log.Printf("control-ready cache sources: closing scoped store for %s after alt-store error: %v", dir, closeErr)
+			}
+			return nil, nil, altErr
+		}
+		if alt != nil {
+			sources = append(sources, alt)
+		}
 	}
-	return []beads.Store{scoped}, []beads.Store{scoped}, nil
+	if binding, federated := controlGraphExtraLeg(cityPath, dir); federated {
+		sources = append(sources, binding)
+	}
+	return sources, owned, nil
 }
 
 // controlReadyCacheSourcesFn is the test seam for controlReadyCacheSources,
@@ -603,7 +638,7 @@ func tryControlReadyFromCacheOrFallback(workQuery, dir string, env map[string]st
 		}
 	}
 
-	ready, err := controlReadyFallbackReady(dir, cityPath, env, parsed.includeEphemeral)
+	ready, err := controlReadyFallbackReady(dir, cityPath, cfg, env, parsed.includeEphemeral)
 	if err != nil {
 		return nil, true, err
 	}
