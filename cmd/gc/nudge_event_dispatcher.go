@@ -546,20 +546,25 @@ func (d *nudgeEventDispatcher) spawnPass(sessionFilter string, retriesLeft int) 
 	d.delivery.Add(1)
 	go func() {
 		defer d.delivery.Done()
-		defer func() {
-			d.mu.Lock()
-			delete(d.inflight, sessionFilter)
-			d.mu.Unlock()
-		}()
 		defer d.acquirePassSlot()()
 		d.pass(sessionFilter, retriesLeft)
 	}()
 }
 
 // not "a pass delivered something".
+//
+// inflight is cleared here, before the observer is notified, not in a defer
+// back in spawnPass. A caller driven by the observer (tests, and anything
+// else that reacts to "a pass completed") must see a sessionFilter that is
+// immediately re-kickable: clearing it after the notification left a window
+// where a kick landing right after completion found the slot still marked
+// in-flight and was silently dropped, losing the kick with nothing left to
+// wake it — the dispatcher's next observer wait then had no pass coming and
+// timed out.
 func (d *nudgeEventDispatcher) pass(sessionFilter string, retriesLeft int) {
 	d.runPass(sessionFilter, retriesLeft)
 	d.mu.Lock()
+	delete(d.inflight, sessionFilter)
 	observe := d.passObserver
 	d.mu.Unlock()
 	if observe != nil {
