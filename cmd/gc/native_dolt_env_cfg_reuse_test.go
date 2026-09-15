@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// openStoreResultAtForCityWithAuthority loads the city config, then opens the
-// store. Opening the native store with a nil config made the rig-scoped
+// openStoreResultAtForCityWithConfigAndProvider loads the city config, then
+// opens the store. Opening the native store with a nil config made the rig-scoped
 // projection load that same city config again — pack expansion and builtin
 // cache readiness included — for one store open, on a path `gc bd` reaches
 // while it is only resolving which store a bead ID belongs to.
@@ -17,7 +17,7 @@ import (
 // after the open, on a reconnect where re-reading current config is the point.
 func TestOpenNativeStoreReusesTheLoadedCityConfig(t *testing.T) {
 	const (
-		enclosing = "openStoreResultAtForCityWithConfig"
+		enclosing = "openStoreResultAtForCityWithConfigAndProvider"
 		field     = "OpenNativeStore"
 		callee    = "nativeDoltOpenEnvForScope"
 		wantArg   = "cfg"

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -22,7 +23,35 @@ const (
 	mixedCityWorker    = "worker"
 )
 
-func mixedCityRootFixture(t *testing.T, altReadyIDs ...string) (string, *config.City, beads.Store) {
+type cityRootTestEnv string
+
+const (
+	cityRootEnvUnpinned cityRootTestEnv = "unpinned"
+	cityRootEnvSeat     cityRootTestEnv = "seat"
+)
+
+func testCityRootEnvs(t *testing.T, test func(*testing.T, cityRootTestEnv)) {
+	t.Helper()
+	for _, env := range []cityRootTestEnv{cityRootEnvUnpinned, cityRootEnvSeat} {
+		t.Run(string(env), func(t *testing.T) { test(t, env) })
+	}
+}
+
+func applyCityRootTestEnv(t *testing.T, env cityRootTestEnv, cityPath, provider string) {
+	t.Helper()
+	switch env {
+	case cityRootEnvUnpinned:
+		t.Setenv("GC_BEADS", "")
+		t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	case cityRootEnvSeat:
+		t.Setenv("GC_BEADS", provider)
+		t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
+	default:
+		t.Fatalf("unknown city-root test environment %q", env)
+	}
+}
+
+func mixedCityRootFixture(t *testing.T, env cityRootTestEnv, altReadyIDs ...string) (string, *config.City, beads.Store) {
 	t.Helper()
 	configureIsolatedRuntimeEnv(t)
 	t.Setenv("GC_BEADS_FORCE_FALLBACK", "1")
@@ -48,6 +77,7 @@ provider = "file"
 	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "config.yaml"), []byte("issue_prefix: "+mixedCityAltPrefix+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	applyCityRootTestEnv(t, env, cityPath, "file")
 	if got := readScopeIssuePrefix(cityPath); got != mixedCityAltPrefix {
 		t.Fatalf("fixture issue prefix = %q, want %q", got, mixedCityAltPrefix)
 	}
@@ -73,7 +103,10 @@ done
 case " $* " in
   *" ready "*) cat %q ;;
   *" show "*)
-    printf '[{"id":"%%s","title":"alternate work","status":"in_progress","issue_type":"task","priority":2,"created_at":"2026-01-01T00:00:00Z","assignee":"worker","metadata":{"gc.routed_to":"worker"}}]' "$id"
+    case "$id" in
+      gc-*) printf 'Error: issue %%s not found\n' "$id" >&2; exit 1 ;;
+      *) printf '[{"id":"%%s","title":"alternate work","status":"in_progress","issue_type":"task","priority":2,"created_at":"2026-01-01T00:00:00Z","assignee":"worker","metadata":{"gc.routed_to":"worker"}}]' "$id" ;;
+    esac
     ;;
   *" --claim "*)
     case "$id" in
@@ -131,175 +164,208 @@ func mixedCityDemand(t *testing.T, cityPath string, cfg *config.City, store bead
 }
 
 func TestMixedCityRootDemandSeesAlternateStore(t *testing.T) {
-	cityPath, cfg, store := mixedCityRootFixture(t, "dr-ready")
-	got := mixedCityDemand(t, cityPath, cfg, store)
-	if got.ScaleCheckCounts[mixedCityWorker] != 1 {
-		t.Fatalf("ScaleCheckCounts[%s] = %d, want 1 from alternate city-root store (all=%v)", mixedCityWorker, got.ScaleCheckCounts[mixedCityWorker], got.ScaleCheckCounts)
-	}
+	testCityRootEnvs(t, func(t *testing.T, env cityRootTestEnv) {
+		cityPath, cfg, store := mixedCityRootFixture(t, env, "dr-ready")
+		got := mixedCityDemand(t, cityPath, cfg, store)
+		if got.ScaleCheckCounts[mixedCityWorker] != 1 {
+			t.Fatalf("ScaleCheckCounts[%s] = %d, want 1 from alternate city-root store (all=%v)", mixedCityWorker, got.ScaleCheckCounts[mixedCityWorker], got.ScaleCheckCounts)
+		}
+	})
 }
 
 func TestMixedCityRootControlReadySourcesSeeAlternateStore(t *testing.T) {
-	cityPath, cfg, store := mixedCityRootFixture(t, "dr-control", "dr-control")
-	fileBead := createMixedCityFileWork(t, store, "configured control")
-	sources, _, err := controlReadyCacheSources(cityPath, cityPath, cfg)
-	if err != nil {
-		t.Fatalf("controlReadyCacheSources: %v", err)
-	}
-	var legs [][]beads.Bead
-	for _, source := range sources {
-		ready, readyErr := source.Ready()
-		if readyErr != nil {
-			t.Fatalf("source Ready: %v", readyErr)
+	testCityRootEnvs(t, func(t *testing.T, env cityRootTestEnv) {
+		cityPath, cfg, store := mixedCityRootFixture(t, env, "dr-control", "dr-control")
+		fileBead := createMixedCityFileWork(t, store, "configured control")
+		sources, _, err := controlReadyCacheSources(cityPath, cityPath, cfg)
+		if err != nil {
+			t.Fatalf("controlReadyCacheSources: %v", err)
 		}
-		legs = append(legs, ready)
-	}
-	got := mergeControlReadyLegs(legs...)
-	if !containsID(got, "dr-control") {
-		t.Fatalf("merged ready sources = %v, want dr-control", controlLegIDs(got))
-	}
-	if countID(got, "dr-control") != 1 {
-		t.Fatalf("merged ready sources = %v, want dr-control exactly once", controlLegIDs(got))
-	}
-	fallback, err := controlReadyFallbackReady(cityPath, cityPath, cfg, nil, false)
-	if err != nil {
-		t.Fatalf("controlReadyFallbackReady: %v", err)
-	}
-	if !containsID(fallback, "dr-control") || !containsID(fallback, fileBead.ID) || countID(fallback, "dr-control") != 1 {
-		t.Fatalf("fallback ready = %v, want one dr-control plus %s", controlLegIDs(fallback), fileBead.ID)
-	}
+		var legs [][]beads.Bead
+		for _, source := range sources {
+			ready, readyErr := source.Ready()
+			if readyErr != nil {
+				t.Fatalf("source Ready: %v", readyErr)
+			}
+			legs = append(legs, ready)
+		}
+		got := mergeControlReadyLegs(legs...)
+		if !containsID(got, "dr-control") {
+			t.Fatalf("merged ready sources = %v, want dr-control", controlLegIDs(got))
+		}
+		if countID(got, "dr-control") != 1 {
+			t.Fatalf("merged ready sources = %v, want dr-control exactly once", controlLegIDs(got))
+		}
+		fallback, err := controlReadyFallbackReady(cityPath, cityPath, cfg, nil, false)
+		if err != nil {
+			t.Fatalf("controlReadyFallbackReady: %v", err)
+		}
+		if !containsID(fallback, "dr-control") || !containsID(fallback, fileBead.ID) || countID(fallback, "dr-control") != 1 {
+			t.Fatalf("fallback ready = %v, want one dr-control plus %s", controlLegIDs(fallback), fileBead.ID)
+		}
+	})
 }
 
 func TestMixedCityRootControlLedgerUsesExistingResolutionBeforeAlternatePrefix(t *testing.T) {
-	cityPath, cfg, store := mixedCityRootFixture(t, "dr-control")
-	fileBead := createMixedCityFileWork(t, store, "configured control")
+	testCityRootEnvs(t, func(t *testing.T, env cityRootTestEnv) {
+		cityPath, cfg, store := mixedCityRootFixture(t, env, "dr-control")
+		fileBead := createMixedCityFileWork(t, store, "configured control")
 
-	altOwner, gotAlt, err := controlBeadLedger(cityPath, cityPath, cfg, store, "dr-control")
-	if err != nil {
-		t.Fatalf("alternate prefix: %v", err)
-	}
-	altInner, _, _ := unwrapBeadPolicyStore(altOwner)
-	if _, ok := altInner.(*beads.BdStore); !ok || gotAlt.ID != "dr-control" {
-		t.Fatalf("alternate prefix resolved (%T, %q), want *beads.BdStore and dr-control", altOwner, gotAlt.ID)
-	}
-
-	fileOwner, gotFile, err := controlBeadLedger(cityPath, cityPath, cfg, store, fileBead.ID)
-	if err != nil {
-		t.Fatalf("configured store first: %v", err)
-	}
-	if fileOwner != store || gotFile.ID != fileBead.ID {
-		t.Fatalf("configured store resolved (%T, %q), want original file store and %q", fileOwner, gotFile.ID, fileBead.ID)
-	}
-
-	emptyPrefixPath, emptyPrefixCfg, emptyPrefixStore := mixedCityRootFixture(t)
-	originalOpen := openCityRootAltStoreFn
-	openCityRootAltStoreFn = func(storePath, cityPath string) (beads.Store, error) {
-		if samePath(storePath, emptyPrefixPath) {
-			return beads.NewBdStoreWithPrefix(emptyPrefixPath, nil, ""), nil
+		altOwner, gotAlt, err := controlBeadLedger(cityPath, cityPath, cfg, store, "dr-control")
+		if err != nil {
+			t.Fatalf("alternate prefix: %v", err)
 		}
-		return originalOpen(storePath, cityPath)
-	}
-	t.Cleanup(func() { openCityRootAltStoreFn = originalOpen })
-	_, _, err = controlBeadLedger(emptyPrefixPath, emptyPrefixPath, emptyPrefixCfg, emptyPrefixStore, "dr-missing")
-	if err == nil || !strings.Contains(err.Error(), "declares no issue prefix") {
-		t.Fatalf("missing alternate prefix error = %v, want a fail-closed declaration error", err)
-	}
+		altInner, _, _ := unwrapBeadPolicyStore(altOwner)
+		if _, ok := altInner.(*beads.BdStore); !ok || gotAlt.ID != "dr-control" {
+			t.Fatalf("alternate prefix resolved (%T, %q), want *beads.BdStore and dr-control", altOwner, gotAlt.ID)
+		}
+
+		fileOwner, gotFile, err := controlBeadLedger(cityPath, cityPath, cfg, store, fileBead.ID)
+		if err != nil {
+			t.Fatalf("configured store first: %v", err)
+		}
+		if fileOwner != store || gotFile.ID != fileBead.ID {
+			t.Fatalf("configured store resolved (%T, %q), want original file store and %q", fileOwner, gotFile.ID, fileBead.ID)
+		}
+
+		emptyPrefixPath, emptyPrefixCfg, emptyPrefixStore := mixedCityRootFixture(t, env)
+		originalOpen := openCityRootAltStoreFn
+		openCityRootAltStoreFn = func(storePath, cityPath string) (beads.Store, error) {
+			if samePath(storePath, emptyPrefixPath) {
+				return beads.NewBdStoreWithPrefix(emptyPrefixPath, nil, ""), nil
+			}
+			return originalOpen(storePath, cityPath)
+		}
+		t.Cleanup(func() { openCityRootAltStoreFn = originalOpen })
+		_, _, err = controlBeadLedger(emptyPrefixPath, emptyPrefixPath, emptyPrefixCfg, emptyPrefixStore, "dr-missing")
+		if err == nil || !strings.Contains(err.Error(), "declares no issue prefix") {
+			t.Fatalf("missing alternate prefix error = %v, want a fail-closed declaration error", err)
+		}
+	})
 }
 
 func TestMixedCityRootControlLedgerKeepsGraphBindingFirst(t *testing.T) {
-	cityPath, cfg, store := mixedCityRootFixture(t)
-	binding := beads.NewMemStoreFrom(100, nil, nil)
-	seedCLIStorageRoutes(t, cityPath, messagingSplitRoutes(binding))
-	resident, err := binding.Create(beads.Bead{Title: "binding-resident", Type: "task"})
-	if err != nil {
-		t.Fatalf("create binding bead: %v", err)
-	}
+	testCityRootEnvs(t, func(t *testing.T, env cityRootTestEnv) {
+		cityPath, cfg, store := mixedCityRootFixture(t, env)
+		binding := beads.NewMemStoreFrom(100, nil, nil)
+		seedCLIStorageRoutes(t, cityPath, messagingSplitRoutes(binding))
+		resident, err := binding.Create(beads.Bead{Title: "binding-resident", Type: "task"})
+		if err != nil {
+			t.Fatalf("create binding bead: %v", err)
+		}
 
-	gotStore, gotBead, err := controlBeadLedger(cityPath, cityPath, cfg, store, resident.ID)
-	if err != nil {
-		t.Fatalf("controlBeadLedger for a mixed-root binding id: %v", err)
-	}
-	if gotBead.ID != resident.ID {
-		t.Fatalf("resolved bead = %q, want %q", gotBead.ID, resident.ID)
-	}
-	probe, err := gotStore.Create(beads.Bead{Title: "probe", Type: "task"})
-	if err != nil {
-		t.Fatalf("write through resolved graph store: %v", err)
-	}
-	if _, err := binding.Get(probe.ID); err != nil {
-		t.Fatalf("resolved store did not write to graph binding: %v", err)
-	}
+		gotStore, gotBead, err := controlBeadLedger(cityPath, cityPath, cfg, store, resident.ID)
+		if err != nil {
+			t.Fatalf("controlBeadLedger for a mixed-root binding id: %v", err)
+		}
+		if gotBead.ID != resident.ID {
+			t.Fatalf("resolved bead = %q, want %q", gotBead.ID, resident.ID)
+		}
+		probe, err := gotStore.Create(beads.Bead{Title: "probe", Type: "task"})
+		if err != nil {
+			t.Fatalf("write through resolved graph store: %v", err)
+		}
+		if _, err := binding.Get(probe.ID); err != nil {
+			t.Fatalf("resolved store did not write to graph binding: %v", err)
+		}
+		if !cityRootIsMixed(cityPath) {
+			t.Fatal("mixed-root graph fixture detected as single-store")
+		}
+	})
 }
 
 func TestCityRootAltStoreOpensOnceAcrossMixedRootReaders(t *testing.T) {
-	cityPath, cfg, store := mixedCityRootFixture(t, "dr-control")
-	originalOpen := openCityRootAltStoreFn
-	opens := 0
-	openCityRootAltStoreFn = func(storePath, cityPath string) (beads.Store, error) {
-		opens++
-		return originalOpen(storePath, cityPath)
-	}
-	t.Cleanup(func() { openCityRootAltStoreFn = originalOpen })
+	testCityRootEnvs(t, func(t *testing.T, env cityRootTestEnv) {
+		cityPath, cfg, store := mixedCityRootFixture(t, env, "dr-control")
+		originalOpen := openCityRootAltStoreFn
+		opens := 0
+		openCityRootAltStoreFn = func(storePath, cityPath string) (beads.Store, error) {
+			opens++
+			return originalOpen(storePath, cityPath)
+		}
+		t.Cleanup(func() { openCityRootAltStoreFn = originalOpen })
 
-	beforeClaimOps := opens
-	for range 3 {
-		if _, err := mixedCityRootHookClaimOps(cityPath, hookClaimOps{}); err != nil {
-			t.Fatalf("claim ops: %v", err)
+		beforeClaimOps := opens
+		for range 3 {
+			if _, err := mixedCityRootHookClaimOps(cityPath, hookClaimOps{}); err != nil {
+				t.Fatalf("claim ops: %v", err)
+			}
 		}
-	}
-	if claimOpens := opens - beforeClaimOps; claimOpens != 0 {
-		t.Errorf("claim-op construction opened the alternate store %d times, want zero", claimOpens)
-	}
-	for range 3 {
-		_ = mixedCityDemand(t, cityPath, cfg, store)
-	}
-	for range 3 {
-		if _, err := controlReadyFallbackReady(cityPath, cityPath, cfg, nil, false); err != nil {
-			t.Fatalf("fallback ready: %v", err)
+		if claimOpens := opens - beforeClaimOps; claimOpens != 0 {
+			t.Errorf("claim-op construction opened the alternate store %d times, want zero", claimOpens)
 		}
-	}
-	for range 3 {
-		if _, _, err := controlReadyCacheSources(cityPath, cityPath, cfg); err != nil {
-			t.Fatalf("cache sources: %v", err)
+		for range 3 {
+			_ = mixedCityDemand(t, cityPath, cfg, store)
 		}
-	}
-	for range 3 {
-		_, _, _ = controlBeadLedger(cityPath, cityPath, cfg, store, "dr-control")
-	}
-	if opens != 1 {
-		t.Fatalf("alternate store open count = %d, want exactly one across all readers", opens)
-	}
+		for range 3 {
+			if _, err := controlReadyFallbackReady(cityPath, cityPath, cfg, nil, false); err != nil {
+				t.Fatalf("fallback ready: %v", err)
+			}
+		}
+		for range 3 {
+			if _, _, err := controlReadyCacheSources(cityPath, cityPath, cfg); err != nil {
+				t.Fatalf("cache sources: %v", err)
+			}
+		}
+		for range 3 {
+			_, _, _ = controlBeadLedger(cityPath, cityPath, cfg, store, "dr-control")
+		}
+		if opens != 1 {
+			t.Fatalf("alternate store open count = %d, want exactly one across all readers", opens)
+		}
+	})
 }
 
 func TestCityRootAltStoreRetriesAfterOpenError(t *testing.T) {
-	cityPath, _, _ := mixedCityRootFixture(t)
-	originalOpen := openCityRootAltStoreFn
-	opens := 0
-	openCityRootAltStoreFn = func(storePath, cityPath string) (beads.Store, error) {
-		opens++
-		if opens == 1 {
-			return nil, fmt.Errorf("injected open failure")
+	testCityRootEnvs(t, func(t *testing.T, env cityRootTestEnv) {
+		cityPath, _, _ := mixedCityRootFixture(t, env)
+		originalOpen := openCityRootAltStoreFn
+		opens := 0
+		openCityRootAltStoreFn = func(storePath, cityPath string) (beads.Store, error) {
+			opens++
+			if opens == 1 {
+				return nil, fmt.Errorf("injected open failure")
+			}
+			return originalOpen(storePath, cityPath)
 		}
-		return originalOpen(storePath, cityPath)
-	}
-	t.Cleanup(func() { openCityRootAltStoreFn = originalOpen })
+		t.Cleanup(func() { openCityRootAltStoreFn = originalOpen })
 
-	if _, err := cityRootAltStore(cityPath); err == nil || !strings.Contains(err.Error(), "injected open failure") {
-		t.Fatalf("first open error = %v, want injected failure", err)
-	}
-	second, err := cityRootAltStore(cityPath)
-	if err != nil || second == nil {
-		t.Fatalf("retry = (%T, %v), want a store", second, err)
-	}
-	third, err := cityRootAltStore(cityPath)
-	if err != nil || third == nil {
-		t.Fatalf("memoized read = (%T, %v), want a store", third, err)
-	}
-	if opens != 2 {
-		t.Fatalf("alternate store open count = %d, want two (one failed attempt and one memoized success)", opens)
-	}
-	if second != third {
-		t.Fatalf("memoized store identity changed: %p then %p", second, third)
-	}
+		if _, err := cityRootAltStore(cityPath); err == nil || !strings.Contains(err.Error(), "injected open failure") {
+			t.Fatalf("first open error = %v, want injected failure", err)
+		}
+		second, err := cityRootAltStore(cityPath)
+		if err != nil || second == nil {
+			t.Fatalf("retry = (%T, %v), want a store", second, err)
+		}
+		third, err := cityRootAltStore(cityPath)
+		if err != nil || third == nil {
+			t.Fatalf("memoized read = (%T, %v), want a store", third, err)
+		}
+		if opens != 2 {
+			t.Fatalf("alternate store open count = %d, want two (one failed attempt and one memoized success)", opens)
+		}
+		if second != third {
+			t.Fatalf("memoized store identity changed: %p then %p", second, third)
+		}
+	})
+}
+
+func TestCityRootAltStoreUsesOnDiskProvider(t *testing.T) {
+	testCityRootEnvs(t, func(t *testing.T, env cityRootTestEnv) {
+		cityPath, _, fileStore := mixedCityRootFixture(t, env, "dr-store-id")
+		fileBead := createMixedCityFileWork(t, fileStore, "file-store identity")
+
+		alt, err := cityRootAltStore(cityPath)
+		if err != nil || alt == nil {
+			t.Fatalf("cityRootAltStore = (%T, %v), want alternate store", alt, err)
+		}
+		if bead, err := alt.Get("dr-store-id"); err != nil || bead.ID != "dr-store-id" {
+			t.Fatalf("alternate Get(dr-store-id) = (%q, %v), want bd-store bead", bead.ID, err)
+		}
+		if bead, err := alt.Get(fileBead.ID); !errors.Is(err, beads.ErrNotFound) {
+			t.Fatalf("alternate Get(%s) = (%q, %v), want beads.ErrNotFound", fileBead.ID, bead.ID, err)
+		}
+	})
 }
 
 func claimOneMixedCityBead(t *testing.T, cityPath, beadID string) {
@@ -337,78 +403,119 @@ func claimOneMixedCityBead(t *testing.T, cityPath, beadID string) {
 }
 
 func TestMixedCityRootClaimFallsBackToConfiguredFileStore(t *testing.T) {
-	cityPath, _, store := mixedCityRootFixture(t)
-	fileBead := createMixedCityFileWork(t, store, "configured claim")
-	claimOneMixedCityBead(t, cityPath, fileBead.ID)
-	got, err := store.Get(fileBead.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Status != "in_progress" || got.Assignee != mixedCityWorker {
-		t.Fatalf("claimed file bead = status %q assignee %q", got.Status, got.Assignee)
-	}
+	testCityRootEnvs(t, func(t *testing.T, env cityRootTestEnv) {
+		cityPath, _, store := mixedCityRootFixture(t, env)
+		fileBead := createMixedCityFileWork(t, store, "configured claim")
+		claimOneMixedCityBead(t, cityPath, fileBead.ID)
+		got, err := store.Get(fileBead.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != "in_progress" || got.Assignee != mixedCityWorker {
+			t.Fatalf("claimed file bead = status %q assignee %q", got.Status, got.Assignee)
+		}
+	})
 }
 
 func TestMixedCityRootDemandCountsExactlyClaimableWork(t *testing.T) {
-	cityPath, cfg, store := mixedCityRootFixture(t, "dr-ready")
-	fileBead := createMixedCityFileWork(t, store, "configured ready")
-	alt, err := openAuthoritativeStoreAtForCity(cityPath, cityPath)
-	if err != nil || alt == nil {
-		t.Fatalf("openAuthoritativeStoreAtForCity = (%T, %v), want alternate store", alt, err)
-	}
-	counts, demand, partial, errs := defaultScaleCheckCountsAndDemand(cfg, []defaultScaleCheckTarget{
-		{template: mixedCityWorker, storeKey: "city", store: store},
-		{template: mixedCityWorker, storeKey: "city", store: alt},
+	testCityRootEnvs(t, func(t *testing.T, env cityRootTestEnv) {
+		cityPath, cfg, store := mixedCityRootFixture(t, env, "dr-ready")
+		fileBead := createMixedCityFileWork(t, store, "configured ready")
+		alt, err := cityRootAltStore(cityPath)
+		if err != nil || alt == nil {
+			t.Fatalf("cityRootAltStore = (%T, %v), want alternate store", alt, err)
+		}
+		counts, demand, partial, errs := defaultScaleCheckCountsAndDemand(cfg, []defaultScaleCheckTarget{
+			{template: mixedCityWorker, storeKey: "city", store: store},
+			{template: mixedCityWorker, storeKey: "city", store: alt},
+		})
+		if len(errs) != 0 || len(partial) != 0 || counts[mixedCityWorker] != 2 {
+			t.Fatalf("dual-store demand = counts %v partial %v errs %v, want exactly two healthy rows", counts, partial, errs)
+		}
+		ids := append([]string(nil), demand[mixedCityWorker].WorkBeadIDs...)
+		slices.Sort(ids)
+		want := []string{"dr-ready", fileBead.ID}
+		slices.Sort(want)
+		if !slices.Equal(ids, want) {
+			t.Fatalf("demand bead ids = %v, want exactly %v", ids, want)
+		}
+		for _, id := range ids {
+			claimOneMixedCityBead(t, cityPath, id)
+		}
 	})
-	if len(errs) != 0 || len(partial) != 0 || counts[mixedCityWorker] != 2 {
-		t.Fatalf("dual-store demand = counts %v partial %v errs %v, want exactly two healthy rows", counts, partial, errs)
-	}
-	ids := append([]string(nil), demand[mixedCityWorker].WorkBeadIDs...)
-	slices.Sort(ids)
-	want := []string{"dr-ready", fileBead.ID}
-	slices.Sort(want)
-	if !slices.Equal(ids, want) {
-		t.Fatalf("demand bead ids = %v, want exactly %v", ids, want)
-	}
-	for _, id := range ids {
-		claimOneMixedCityBead(t, cityPath, id)
-	}
 }
 
 func TestSingleStoreCityRootRetainsExistingResults(t *testing.T) {
-	configureIsolatedRuntimeEnv(t)
-	cityPath := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname=\"test-city\"\nprefix=\"gc\"\n[beads]\nprovider=\"file\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg := &config.City{Workspace: config.Workspace{Name: "test-city", Prefix: "gc"}, Beads: config.BeadsConfig{Provider: "file"}, Agents: []config.Agent{{Name: mixedCityWorker, StartCommand: "true"}}}
-	store, err := openStoreAtForCity(cityPath, cityPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	work := createMixedCityFileWork(t, store, "single-store work")
-	got := mixedCityDemand(t, cityPath, cfg, store)
-	wantCounts, _, wantErrs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{template: mixedCityWorker, storeKey: "city", store: store}})
-	if len(wantErrs) != 0 || got.ScaleCheckCounts[mixedCityWorker] != wantCounts[mixedCityWorker] {
-		t.Fatalf("single-store demand = %v, want %v (errs=%v)", got.ScaleCheckCounts, wantCounts, wantErrs)
-	}
-	sources, _, err := controlReadyCacheSources(cityPath, cityPath, cfg)
-	if err != nil || len(sources) != 1 {
-		t.Fatalf("single-store ready sources = %d, err=%v; want one", len(sources), err)
-	}
-	owner, resolved, err := controlBeadLedger(cityPath, cityPath, cfg, store, work.ID)
-	if err != nil || owner != store || resolved.ID != work.ID {
-		t.Fatalf("single-store ledger = (%T, %q, %v), want original store and %q", owner, resolved.ID, err, work.ID)
-	}
+	testCityRootEnvs(t, func(t *testing.T, env cityRootTestEnv) {
+		configureIsolatedRuntimeEnv(t)
+		cityPath := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname=\"test-city\"\nprefix=\"gc\"\n[beads]\nprovider=\"file\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		applyCityRootTestEnv(t, env, cityPath, "file")
+		cfg := &config.City{Workspace: config.Workspace{Name: "test-city", Prefix: "gc"}, Beads: config.BeadsConfig{Provider: "file"}, Agents: []config.Agent{{Name: mixedCityWorker, StartCommand: "true"}}}
+		store, err := openStoreAtForCity(cityPath, cityPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cityRootIsMixed(cityPath) {
+			t.Fatal("file-only city root detected as mixed")
+		}
+		work := createMixedCityFileWork(t, store, "single-store work")
+		got := mixedCityDemand(t, cityPath, cfg, store)
+		wantCounts, _, wantErrs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{template: mixedCityWorker, storeKey: "city", store: store}})
+		if len(wantErrs) != 0 || got.ScaleCheckCounts[mixedCityWorker] != wantCounts[mixedCityWorker] {
+			t.Fatalf("single-store demand = %v, want %v (errs=%v)", got.ScaleCheckCounts, wantCounts, wantErrs)
+		}
+		sources, _, err := controlReadyCacheSources(cityPath, cityPath, cfg)
+		if err != nil || len(sources) != 1 {
+			t.Fatalf("single-store ready sources = %d, err=%v; want one", len(sources), err)
+		}
+		owner, resolved, err := controlBeadLedger(cityPath, cityPath, cfg, store, work.ID)
+		if err != nil || owner != store || resolved.ID != work.ID {
+			t.Fatalf("single-store ledger = (%T, %q, %v), want original store and %q", owner, resolved.ID, err, work.ID)
+		}
 
-	mixedPath, mixedCfg, _ := mixedCityRootFixture(t)
-	mixedSources, _, err := controlReadyCacheSources(mixedPath, mixedPath, mixedCfg)
-	if err != nil || len(mixedSources) != 2 {
-		t.Fatalf("mixed-store gate sources = %d, err=%v; want two after the single-store no-op assertions", len(mixedSources), err)
-	}
+		mixedPath, mixedCfg, _ := mixedCityRootFixture(t, env)
+		mixedSources, _, err := controlReadyCacheSources(mixedPath, mixedPath, mixedCfg)
+		if err != nil || len(mixedSources) != 2 {
+			t.Fatalf("mixed-store gate sources = %d, err=%v; want two after the single-store no-op assertions", len(mixedSources), err)
+		}
+
+		bdPath := t.TempDir()
+		if err := os.WriteFile(filepath.Join(bdPath, "city.toml"), []byte("[workspace]\nname=\"bd-city\"\n[beads]\nprovider=\"bd\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(bdPath, ".beads"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bdPath, ".beads", "metadata.json"), []byte(`{"backend":"dolt"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		applyCityRootTestEnv(t, env, bdPath, "bd")
+		if cityRootIsMixed(bdPath) {
+			t.Fatal("bd-only city root detected as mixed")
+		}
+
+		execPath := t.TempDir()
+		execProvider := "exec:/definitely/non-bd-provider"
+		if err := os.WriteFile(filepath.Join(execPath, "city.toml"), []byte("[workspace]\nname=\"exec-city\"\n[beads]\nprovider=\""+execProvider+"\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(execPath, ".beads"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(execPath, ".beads", "metadata.json"), []byte(`{"backend":"dolt"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		applyCityRootTestEnv(t, env, execPath, execProvider)
+		if cityRootIsMixed(execPath) {
+			t.Fatal("custom non-bd exec provider detected as mixed")
+		}
+	})
 }
 
 func countID(rows []beads.Bead, id string) int {
