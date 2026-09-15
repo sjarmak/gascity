@@ -671,7 +671,7 @@ func authoritativeBeadsProviderForScope(scopeRoot, cityPath string) string {
 	return resolveRawBeadsProviderForScope(scopeRoot, cityPath, true)
 }
 
-var openCityRootAltStoreFn = openAuthoritativeStoreAtForCity
+var openCityRootAltStoreFn = openCityRootOnDiskStoreAtForCity
 
 var cityRootAltStores = struct {
 	sync.Mutex
@@ -679,12 +679,33 @@ var cityRootAltStores = struct {
 }{byCity: make(map[string]beads.Store)}
 
 func cityRootIsMixed(cityPath string) bool {
-	configured := rawBeadsProviderForScope(cityPath, cityPath)
-	authoritative := authoritativeBeadsProviderForScope(cityPath, cityPath)
-	return configured != authoritative
+	configured := strings.TrimSpace(rawBeadsProviderForScope(cityPath, cityPath))
+	if strings.HasPrefix(configured, "exec:") && !providerUsesBdStoreContract(configured) {
+		return false
+	}
+	onDisk := cityRootOnDiskProvider(cityPath)
+	return onDisk != "" && configured != onDisk
 }
 
-// cityRootAltStore opens the authoritative city-root store only when it is a
+func cityRootOnDiskProvider(cityPath string) string {
+	if scopeUsesBdStoreContract(cityPath) {
+		return "bd"
+	}
+	if scopeUsesFileStoreContract(cityPath) {
+		return "file"
+	}
+	return ""
+}
+
+func openCityRootOnDiskStoreAtForCity(storePath, cityPath string) (beads.Store, error) {
+	provider := cityRootOnDiskProvider(cityPath)
+	if provider == "" {
+		return nil, fmt.Errorf("city root %q has no on-disk beads store identity", cityPath)
+	}
+	return openStoreAtForCityWithProvider(storePath, cityPath, provider)
+}
+
+// cityRootAltStore opens the on-disk city-root store only when it is a
 // different provider from the configured city store. A nil store means the
 // city root has one store and callers must retain their existing path exactly.
 func cityRootAltStore(cityPath string) (beads.Store, error) {

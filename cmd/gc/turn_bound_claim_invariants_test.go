@@ -11,7 +11,7 @@ import (
 // claimCASAllowedFiles is the closed set of non-test cmd/gc files that may
 // perform a claim compare-and-swap.
 //
-// The point of the set is that it is CLOSED, not that these four are special.
+// The point of the set is that it is CLOSED, not that its entries are special.
 // Pull semantics are absolute — the controller never assigns, workers discover
 // and claim — and the way that invariant dies is a well-meaning controller-side
 // "pre-stamp the assignee so the worker finds it faster" landing in the
@@ -19,6 +19,10 @@ import (
 //
 //   - cmd_hook_claim.go / claim_class_route.go: the fenced hook claim path
 //     (F-A/F-B/F-C run here, so a claim added here inherits the turn binding).
+//   - claim_city_root_alt_store.go: the mixed-root fallback ORIGINATES the
+//     configured-store claim CAS after the work-directory claim misses. Its
+//     only production caller is the worker's own `gc hook --claim` pull, and it
+//     claims for that worker's assignee, so no controller path assigns work.
 //   - cmd_bd_by_id.go: the `gc bd update <id> --claim` verb an agent runs for
 //     itself, in its own turn.
 //   - cmd_agent_script.go: the deterministic non-LLM executor, which claims and
@@ -34,16 +38,18 @@ import (
 //     wrapper without the method degrades `gc hook --claim` to "this binding
 //     cannot claim" on every split city. The invariant this guard protects —
 //     the controller never assigns — is untouched: nothing here decides to
-//     claim, and the callers that do are still exactly the four above.
+//     claim, and the callers that do remain the sanctioned worker-side pulls
+//     above.
 //
 // Adding a file here is a design decision about pull semantics; make it
 // deliberately.
 var claimCASAllowedFiles = map[string]bool{
-	"cmd_hook_claim.go":    true,
-	"claim_class_route.go": true,
-	"cmd_bd_by_id.go":      true,
-	"cmd_agent_script.go":  true,
-	"class_store_emit.go":  true,
+	"cmd_hook_claim.go":            true,
+	"claim_class_route.go":         true,
+	"claim_city_root_alt_store.go": true,
+	"cmd_bd_by_id.go":              true,
+	"cmd_agent_script.go":          true,
+	"class_store_emit.go":          true,
 }
 
 // claimCASMarkers are the two shapes a claim compare-and-swap takes in this

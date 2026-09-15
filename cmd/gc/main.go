@@ -1564,6 +1564,14 @@ func openAuthoritativeStoreAtForCity(storePath, cityPath string) (beads.Store, e
 	return openStoreAtForCityWithAuthority(storePath, cityPath, true)
 }
 
+func openStoreAtForCityWithProvider(storePath, cityPath, provider string) (beads.Store, error) {
+	result, err := openStoreResultAtForCityWithConfigAndProvider(storePath, cityPath, nil, gate.ModeUnset, false, false, false, provider)
+	if err != nil {
+		return nil, err
+	}
+	return result.Store, nil
+}
+
 func openStoreAtForCityWithAuthority(storePath, cityPath string, authoritative bool) (beads.Store, error) {
 	result, err := openStoreResultAtForCityWithAuthority(storePath, cityPath, gate.ModeUnset, false, authoritative, false)
 	if err != nil {
@@ -1600,6 +1608,10 @@ func openStoreResultAtForCityWithAuthority(storePath, cityPath string, modeOverr
 // project pool; every other open is a one-shot CLI open and takes the
 // single-connection cap from nativeDoltOneShotOpenEnvForScope.
 func openStoreResultAtForCityWithConfig(storePath, cityPath string, cfg *config.City, modeOverride gate.Mode, haveMode, authoritative, longLived bool) (beads.StoreOpenResult, error) {
+	return openStoreResultAtForCityWithConfigAndProvider(storePath, cityPath, cfg, modeOverride, haveMode, authoritative, longLived, "")
+}
+
+func openStoreResultAtForCityWithConfigAndProvider(storePath, cityPath string, cfg *config.City, modeOverride gate.Mode, haveMode, authoritative, longLived bool, explicitProvider string) (beads.StoreOpenResult, error) {
 	runtimeCityPath := cityPath
 	if runtimeCityPath == "" {
 		runtimeCityPath = cityForStoreDir(storePath)
@@ -1613,9 +1625,12 @@ func openStoreResultAtForCityWithConfig(storePath, cityPath string, cfg *config.
 		_ = ensureBuiltinRuntimeAssetsForSuppliedConfig(runtimeCityPath, io.Discard)
 	}
 	scopeRoot := resolveStoreScopeRoot(runtimeCityPath, storePath)
-	provider := rawBeadsProviderForScope(scopeRoot, runtimeCityPath)
-	if authoritative {
-		provider = authoritativeBeadsProviderForScope(scopeRoot, runtimeCityPath)
+	provider := strings.TrimSpace(explicitProvider)
+	if provider == "" {
+		provider = rawBeadsProviderForScope(scopeRoot, runtimeCityPath)
+		if authoritative {
+			provider = authoritativeBeadsProviderForScope(scopeRoot, runtimeCityPath)
+		}
 	}
 	switch strings.TrimSpace(provider) {
 	case "sqlite", "sqlite-cgo", "coordstore":
