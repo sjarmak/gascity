@@ -27,12 +27,14 @@ package main
 // watchdog dies with its server.
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -67,6 +69,20 @@ const (
 	// one full interval apart distinguish "scope permanently deleted" from
 	// "scope momentarily absent" (crash-adoption window, transient rename).
 	managedDoltScopeGoneConfirmations = 2
+
+	// managedDoltScopeIdleWindowEnv overrides the idle-abandonment window in
+	// milliseconds, following the managedDoltScopeWatchdogIntervalEnv
+	// pattern. Tests use it to shrink the production window from hours to
+	// tens of milliseconds.
+	managedDoltScopeIdleWindowEnv = "GC_DOLT_SCOPE_WATCHDOG_IDLE_WINDOW_MS"
+
+	// managedDoltScopeIdleWindowDefault is the production idle-abandonment
+	// window (#4679): how long a temp-rooted scope's server must observe
+	// zero established client connections before the watchdog reaps it.
+	// Abandonment is rare and undetected abandonment is what leaks, not
+	// speed, so this is deliberately long -- an agent idle between
+	// operations must never be mistaken for a dead scope.
+	managedDoltScopeIdleWindowDefault = 6 * time.Hour
 )
 
 func init() {
@@ -121,6 +137,118 @@ func managedDoltScopeGone(configFile string) bool {
 	}
 	_, err := os.Stat(configFile)
 	return errors.Is(err, fs.ErrNotExist)
+}
+
+// managedDoltScopeIdleWindow resolves the idle-abandonment window, honoring
+// the millisecond test override when it parses to a positive value.
+func managedDoltScopeIdleWindow() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(managedDoltScopeIdleWindowEnv))
+	if raw == "" {
+		return managedDoltScopeIdleWindowDefault
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return managedDoltScopeIdleWindowDefault
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// managedDoltScopeRootEphemeral reports whether cityPath sits under the OS
+// temp directory -- the gate for the idle-abandonment leg (#4679). Only
+// ephemeral scopes (agent scratchpads under /tmp, ad hoc kept worktrees) are
+// eligible; the canonical city, and any non-temp rig checkout, keeps today's
+// behavior byte for byte.
+func managedDoltScopeRootEphemeral(cityPath string) bool {
+	cityPath = strings.TrimSpace(cityPath)
+	if cityPath == "" {
+		return false
+	}
+	tempDir := filepath.Clean(os.TempDir())
+	if tempDir == "" || tempDir == string(filepath.Separator) {
+		return false
+	}
+	clean := filepath.Clean(cityPath)
+	return clean == tempDir || strings.HasPrefix(clean, tempDir+string(filepath.Separator))
+}
+
+// configuredListenerPort extracts the `listener: / port:` value written into
+// a managed dolt config file by writeManagedDoltConfigFile. The second
+// result reports whether a well-formed port line was found; a missing or
+// malformed line composes to "unknown," which the idle-abandonment leg
+// treats the same as "connected" so it never reaps on a bad read.
+func configuredListenerPort(configFile string) (uint16, bool) {
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		return 0, false
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		trimmed := strings.TrimSpace(scanner.Text())
+		rest, ok := strings.CutPrefix(trimmed, "port:")
+		if !ok {
+			continue
+		}
+		rest = strings.Trim(strings.TrimSpace(rest), `"'`)
+		portNum, err := strconv.ParseUint(rest, 10, 16)
+		if err != nil {
+			continue
+		}
+		return uint16(portNum), true
+	}
+	return 0, false
+}
+
+// establishedConnectionCount counts ESTABLISHED TCP connections (state "01")
+// whose local port is port, by scanning /proc/net/tcp and /proc/net/tcp6 --
+// the same no-status-files, live-filesystem-read approach as
+// managedDoltScopeGone and the existing listeningSocketInodesFromProc helper.
+// The bool result reports whether either table was readable at all; false
+// means "unknown," not "zero," so a degraded /proc read is never misread as
+// an idle server.
+func establishedConnectionCount(port uint16) (int, bool) {
+	count := 0
+	checked := false
+	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		checked = true
+		scanner := bufio.NewScanner(strings.NewReader(string(data)))
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+			if len(fields) < 4 || fields[3] != "01" {
+				continue
+			}
+			_, portHex, ok := strings.Cut(fields[1], ":")
+			if !ok {
+				continue
+			}
+			gotPort, err := strconv.ParseUint(portHex, 16, 16)
+			if err != nil || uint16(gotPort) != port {
+				continue
+			}
+			count++
+		}
+	}
+	return count, checked
+}
+
+// managedDoltScopeHasZeroConnections reports whether the managed dolt server
+// anchored by configFile currently has zero established client connections.
+// The second result reports whether the observation is trustworthy (a known
+// listener port and a readable /proc/net/tcp{,6}); an unknown observation
+// composes to "not idle" at the call site, never to a reap.
+func managedDoltScopeHasZeroConnections(configFile string) (bool, bool) {
+	port, ok := configuredListenerPort(configFile)
+	if !ok {
+		return false, false
+	}
+	count, checked := establishedConnectionCount(port)
+	if !checked {
+		return false, false
+	}
+	return count == 0, true
 }
 
 // startManagedDoltSQLServerWithScopeWatchdog spawns the managed dolt
@@ -244,9 +372,13 @@ func runManagedDoltScopeWatchdog(args []string, stdout, stderr *os.File) int {
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(signals)
 
+	ephemeralScope := managedDoltScopeRootEphemeral(cityPath)
+	idleWindow := managedDoltScopeIdleWindow()
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	goneStreak := 0
+	var idleSince time.Time
 	for {
 		select {
 		case sig := <-signals:
@@ -255,19 +387,38 @@ func runManagedDoltScopeWatchdog(args []string, stdout, stderr *os.File) int {
 			<-done
 			return 0
 		case <-ticker.C:
-			if !managedDoltScopeGone(configFile) {
-				goneStreak = 0
+			if managedDoltScopeGone(configFile) {
+				goneStreak++
+				if goneStreak < managedDoltScopeGoneConfirmations {
+					continue
+				}
+				fmt.Fprintf(logFile, "gc scope watchdog: config %s gone for %d consecutive checks; terminating dolt sql-server pid %d\n", //nolint:errcheck
+					configFile, goneStreak, cmd.Process.Pid)
+				_ = terminateManagedDoltScopeWatchdogChild(cityPath, cmd.Process.Pid, startTicks, startIdentity)
+				<-done
+				return 0
+			}
+			goneStreak = 0
+
+			if !ephemeralScope {
 				continue
 			}
-			goneStreak++
-			if goneStreak < managedDoltScopeGoneConfirmations {
+			zero, known := managedDoltScopeHasZeroConnections(configFile)
+			if !known || !zero {
+				idleSince = time.Time{}
 				continue
 			}
-			fmt.Fprintf(logFile, "gc scope watchdog: config %s gone for %d consecutive checks; terminating dolt sql-server pid %d\n", //nolint:errcheck
-				configFile, goneStreak, cmd.Process.Pid)
-			_ = terminateManagedDoltScopeWatchdogChild(cityPath, cmd.Process.Pid, startTicks, startIdentity)
-			<-done
-			return 0
+			if idleSince.IsZero() {
+				idleSince = time.Now()
+				continue
+			}
+			if idleWait := time.Since(idleSince); idleWait >= idleWindow {
+				fmt.Fprintf(logFile, "gc scope watchdog: temp-rooted scope %s idle with zero client connections for %s; terminating dolt sql-server pid %d\n", //nolint:errcheck
+					cityPath, idleWait, cmd.Process.Pid)
+				_ = terminateManagedDoltScopeWatchdogChild(cityPath, cmd.Process.Pid, startTicks, startIdentity)
+				<-done
+				return 0
+			}
 		case err := <-done:
 			if err != nil {
 				fmt.Fprintf(logFile, "gc scope watchdog: dolt sql-server pid %d exited with error: %v\n", cmd.Process.Pid, err) //nolint:errcheck
