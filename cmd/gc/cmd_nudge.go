@@ -2671,11 +2671,68 @@ func recordQueuedNudgeFailureDetailed(cityPath string, store beads.NudgesStore, 
 	// pruneDeadQueuedNudges repairs dead entries whose backing bead missed
 	// terminal state, so drift converges on later queue operations.
 	for _, item := range deadLettered {
-		if markErr := markQueuedNudgeTerminal(store, item, "failed", item.LastError, "", now); markErr != nil && nudgeWarningWriter != nil {
+		markErr := markQueuedNudgeTerminal(store, item, "failed", item.LastError, "", now)
+		if markErr != nil && nudgeWarningWriter != nil {
 			fmt.Fprintf(nudgeWarningWriter, "gc nudge: warning: marking dead-lettered nudge %q terminal: %v\n", item.ID, markErr) //nolint:errcheck
+		}
+		// A dead-lettered nudge must surface to a reader -- city mail or a
+		// bead -- never only to state.json (gc-7jjy53 DEFECT 2). The bead
+		// write above is the normal path, but it silently produces nothing
+		// visible when the delivery store had no bead for this item to begin
+		// with (item.BeadID == "", e.g. the store failed to open at enqueue
+		// time) or when SetMetadataBatch/Close themselves failed (markErr !=
+		// nil): [nudgequeue.Store.Terminalize] returns nil, not an error, on
+		// a bead it cannot find, so the caller cannot distinguish "already
+		// terminal" from "was never recorded" by error alone. Whenever bead
+		// visibility is not provably confirmed, fall back to mail addressed
+		// to the nudge's own target agent so a reader still has something to
+		// find. This is deliberately best-effort and independent of the
+		// store/front-door this call already has open (which may itself be
+		// nil): see sendDeadLetterNudgeAlert.
+		beadConfirmed := markErr == nil && store.Store != nil && item.BeadID != ""
+		if !beadConfirmed {
+			if alertErr := sendDeadLetterNudgeAlert(cityPath, store, item, cause); alertErr != nil && nudgeWarningWriter != nil {
+				fmt.Fprintf(nudgeWarningWriter, "gc nudge: warning: alert mail for dead-lettered nudge %q also failed: %v\n", item.ID, alertErr) //nolint:errcheck
+			}
 		}
 	}
 	return deadLettered, nil
+}
+
+// sendDeadLetterNudgeAlert makes a dead-lettered nudge visible to a reader
+// (an agent or a human operator) even when its shadow bead could not be
+// marked terminal -- e.g. the shadow bead was never created in the first
+// place, or SetMetadataBatch/Close on it failed (gc-7jjy53 DEFECT 2: writing
+// a dead-lettered nudge only into state.json is silent loss). It reuses the
+// caller's already-open store when there is one (the common case: the store
+// itself is fine, only this one item's bead write failed or never existed),
+// and only opens a fresh store as a last resort when the caller has none, so
+// the alert still has a chance to land even if the caller's store handle is
+// unusable. It sends city mail addressed to the nudge's own target agent
+// describing what was queued and why delivery was given up on.
+func sendDeadLetterNudgeAlert(cityPath string, store beads.NudgesStore, item queuedNudge, cause error) error {
+	if store.Store == nil {
+		opened, err := openNudgeBeadStoreErr(cityPath)
+		if err != nil {
+			return fmt.Errorf("opening store to alert on dead-lettered nudge %q: %w", item.ID, err)
+		}
+		if opened.Store == nil {
+			return fmt.Errorf("opening store to alert on dead-lettered nudge %q returned no store", item.ID)
+		}
+		defer closeBeadStoreHandle(opened.Store) //nolint:errcheck // best-effort
+		store = opened
+	}
+	mp := newMailProvider(store.Store)
+	subject := fmt.Sprintf("nudge dead-lettered: %s", item.ID)
+	body := fmt.Sprintf(
+		"A nudge queued for %q was dead-lettered after %d attempt(s) and will not be retried.\n\n"+
+			"Message: %s\nSource: %s\nLast error: %v",
+		item.Agent, item.Attempts, item.Message, item.Source, cause,
+	)
+	if _, err := mp.Send("gc-nudge", item.Agent, subject, body); err != nil {
+		return fmt.Errorf("sending dead-letter alert mail for nudge %q: %w", item.ID, err)
+	}
+	return nil
 }
 
 func failedQueuedNudge(item queuedNudge, cause error, now time.Time) (queuedNudge, bool) {

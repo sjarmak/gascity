@@ -144,6 +144,18 @@ func (s *Server) emitSessionSubmitFailed(requestID, errorCode, errorMessage stri
 	s.emitRequestFailed(requestID, RequestOperationSessionSubmit, errorCode, errorMessage)
 }
 
+// emitSessionSubmitUnknown records a request.failed event for session.submit
+// whose delivery could not be confirmed as landed OR as failed, even after
+// reconciliation (session.ErrSubmitUnconfirmed). It reuses the request.failed
+// event/payload shape — no new event type or schema change — but with the
+// distinct error code "submit_unknown" instead of "submit_failed", so a
+// caller that retries on submit_failed does not also retry this: retrying an
+// outcome that may already have landed duplicates the instruction
+// (dr-3msk6.1, 2026-09-16).
+func (s *Server) emitSessionSubmitUnknown(requestID, errorMessage string) {
+	s.emitRequestFailed(requestID, RequestOperationSessionSubmit, "submit_unknown", errorMessage)
+}
+
 // emitRigCreateSucceeded records a request.result.rig.create event — the
 // terminal success of an async server-side rig add.
 func (s *Server) emitRigCreateSucceeded(requestID, rig, prefix, defaultBranch string) {

@@ -601,7 +601,28 @@ func (p *Provider) NudgeNow(name string, content []runtime.ContentBlock) error {
 	if err != nil && (errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer)) {
 		return nil
 	}
-	return err
+	return wrapNudgeSubmitConfirmation(err)
+}
+
+// wrapNudgeSubmitConfirmation layers the provider-agnostic
+// runtime.ErrNudgeSubmit* sentinels onto tmux's own equivalents, so callers
+// above the runtime.Provider boundary (internal/session, internal/api) can
+// classify an ambiguous submit outcome without importing this concrete
+// provider's error types. tmux's own sentinels stay intact underneath (both
+// %w verbs keep their chains errors.Is-matchable), so the existing cmd/gc
+// call sites that check ErrNudgeSubmitDeliveredUnobserved/
+// ErrNudgeSubmitUnconfirmed directly are unaffected.
+func wrapNudgeSubmitConfirmation(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrNudgeSubmitDeliveredUnobserved):
+		return fmt.Errorf("%w: %w", runtime.ErrNudgeSubmitDeliveredUnobserved, err)
+	case errors.Is(err, ErrNudgeSubmitUnconfirmed):
+		return fmt.Errorf("%w: %w", runtime.ErrNudgeSubmitUnconfirmed, err)
+	default:
+		return err
+	}
 }
 
 // SetMeta stores a key-value pair in the named session's tmux environment.

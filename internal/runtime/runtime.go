@@ -73,6 +73,30 @@ var ErrRuntimeUnavailable = errors.New("runtime unavailable: liveness observatio
 // support relaunch; the reconciler treats it as "fall back to full Stop+Start".
 var ErrRelaunchUnsupported = errors.New("runtime does not support warm-box relaunch")
 
+// ErrNudgeSubmitDeliveredUnobserved reports that a provider proved a submit
+// reached the agent (e.g. its composer/input drained) but could not observe
+// the agent's resulting busy/processing indicator within its confirmation
+// budget. Delivery is proven here, not merely likely: callers must report
+// this the same as a plain successful submit and must not retry it. A
+// provider-specific cause is still attached (errors.Is on the concrete
+// sentinel keeps working) so lower-layer callers that need the detail can
+// still get it.
+var ErrNudgeSubmitDeliveredUnobserved = errors.New("runtime: nudge submit delivered but busy state unobserved")
+
+// ErrNudgeSubmitUnconfirmed reports that a provider handed a submit to a
+// session but its own confirmation window closed before it could prove
+// either delivery or failure. This is genuinely UNKNOWN, not a confirmed
+// failure: dr-3msk6.1 (2026-09-16) recorded `gc session submit` reporting
+// this exact class as submit_failed while `gc session peek` on the same
+// session, checked moments later, showed it already RUNNING the submitted
+// command — the busy indicator simply rendered a beat after the provider's
+// own confirm budget closed. Callers must not report this the same as a
+// confirmed failure and must not retry it blindly; reconcile against the
+// session's own state (e.g. runtime.Provider.GetLastActivity) before
+// deciding, the way [Manager.reconcileAmbiguousNudgeSubmit] in
+// internal/session does.
+var ErrNudgeSubmitUnconfirmed = errors.New("runtime: nudge submit unconfirmed")
+
 // IsSessionGone reports whether err represents a "the session is not
 // there" condition — either ErrSessionNotFound or the legacy provider
 // phrasings that predate the sentinel (tmux/subprocess providers may

@@ -717,10 +717,19 @@ func (s *Server) humaHandleSessionSubmit(ctx context.Context, input *SessionSubm
 			return
 		}
 		outcome, submitErr := s.submitMessageToSession(context.Background(), store.Store, id, message, intent)
-		if submitErr != nil {
-			s.emitSessionSubmitFailed(reqID, "submit_failed", submitErr.Error())
-		} else {
+		switch {
+		case submitErr == nil:
 			s.emitSessionSubmitSucceeded(reqID, id, outcome.Queued, string(intent))
+		case errors.Is(submitErr, session.ErrSubmitUnconfirmed):
+			// Neither delivery nor failure was provable even after
+			// reconciling against the session's own activity (see
+			// session.Manager.reconcileAmbiguousNudgeSubmit). Report this
+			// distinctly from submit_failed so a caller keyed on that error
+			// code does not retry blindly and duplicate a message that may
+			// already have landed (dr-3msk6.1).
+			s.emitSessionSubmitUnknown(reqID, submitErr.Error())
+		default:
+			s.emitSessionSubmitFailed(reqID, "submit_failed", submitErr.Error())
 		}
 	}()
 
@@ -798,8 +807,15 @@ func (s *Server) humaHandleSessionMessage(ctx context.Context, input *SessionMes
 			}
 			if err := s.sendUserMessageToSession(ctx, store.Store, id, message); err != nil {
 				code := "message_failed"
-				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				switch {
+				case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
 					code = "timeout"
+				case errors.Is(err, session.ErrSubmitUnconfirmed):
+					// See humaHandleSessionSubmit's identical branch: neither
+					// delivery nor failure was provable, even after
+					// reconciliation. Distinct code so a caller keyed on
+					// message_failed does not retry blindly.
+					code = "message_unknown"
 				}
 				sendResult(messageResult{sessionID: id, errorCode: code, err: err})
 				return

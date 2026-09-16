@@ -38,6 +38,28 @@ const waitIdleNudgeTimeout = 30 * time.Second
 // boundary but persisting the corresponding bead metadata failed.
 var ErrStateSync = errors.New("session state sync failed")
 
+// ErrSubmitUnconfirmed reports that a submit's outcome remains genuinely
+// UNKNOWN after reconciliation (see reconcileAmbiguousNudgeSubmit): the
+// provider could not prove delivery, and the session showed no activity
+// after the attempt either. Callers (internal/api's session submit/message
+// handlers, the CLI direct-submit fallback) must report this distinctly from
+// a confirmed failure and must not retry it blindly — retrying an outcome
+// that may already have landed is exactly the duplicate-nudge failure mode
+// dr-3msk6.1 recorded.
+var ErrSubmitUnconfirmed = errors.New("session: submit outcome unconfirmed")
+
+// submitReconcileWindow bounds how long reconcileAmbiguousNudgeSubmit polls
+// the session's own activity signal after an ambiguous submit before giving
+// up and reporting ErrSubmitUnconfirmed. Short enough not to meaningfully
+// delay a caller waiting on Submit/Message; long enough to catch the
+// dr-3msk6.1 case, where the busy indicator (or, for a command that starts
+// and finishes fast, any pane activity at all) rendered shortly after the
+// provider's own internal confirm budget closed.
+const submitReconcileWindow = 2 * time.Second
+
+// submitReconcilePollInterval is the poll spacing within submitReconcileWindow.
+const submitReconcilePollInterval = 200 * time.Millisecond
+
 // stripResumeFlag removes the resume flag and session key from a command
 // string, returning a command suitable for a fresh start. When the strip
 // is a no-op (the flag/key isn't in cmd, or either argument is empty),
@@ -822,7 +844,9 @@ func formatWaitIdleReminder(source, message string) string {
 
 func (m *Manager) nudgeSession(ctx context.Context, sessName, message string, immediate bool) error {
 	content := runtime.TextContent(message)
+	sendStartedAt := time.Now()
 	err := m.nudgeContent(sessName, content, immediate)
+	err = m.reconcileAmbiguousNudgeSubmit(ctx, sessName, sendStartedAt, err)
 	recordCtx := ctx
 	if recordCtx == nil || recordCtx.Err() != nil {
 		recordCtx = context.Background()
@@ -832,6 +856,63 @@ func (m *Manager) nudgeSession(ctx context.Context, sessName, message string, im
 		return fmt.Errorf("sending message to session: %w", err)
 	}
 	return nil
+}
+
+// reconcileAmbiguousNudgeSubmit resolves a submit outcome the provider's own
+// confirm window could not prove one way or the other, instead of letting an
+// ambiguous result surface as a plain, retryable failure (dr-3msk6.1,
+// 2026-09-16: a delivery that landed was reported submit_failed, and a
+// caller that retries on that duplicates the instruction).
+//
+//   - runtime.ErrNudgeSubmitDeliveredUnobserved: the provider already proved
+//     delivery (e.g. the composer drained); only the busy-state OBSERVATION
+//     timed out. Report success outright.
+//   - runtime.ErrNudgeSubmitUnconfirmed: neither delivery nor failure is
+//     proven yet. Poll the session's own activity signal
+//     (runtime.Provider.GetLastActivity, implemented by every provider) for
+//     up to submitReconcileWindow: any activity timestamped at or after
+//     sendStartedAt proves the message landed — covering both "the busy
+//     indicator rendered a beat late" and "the command ran and finished
+//     inside the observation window" (the case dr-3msk6.1 hit). If nothing
+//     moves, the outcome is genuinely unknown: return ErrSubmitUnconfirmed
+//     so callers report it distinctly from a confirmed failure and do not
+//     retry blindly.
+//   - any other error (including nil) is passed through unchanged: nil is
+//     success, anything else is a confirmed non-delivery.
+func (m *Manager) reconcileAmbiguousNudgeSubmit(ctx context.Context, sessName string, sendStartedAt time.Time, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, runtime.ErrNudgeSubmitDeliveredUnobserved) {
+		return nil
+	}
+	if !errors.Is(err, runtime.ErrNudgeSubmitUnconfirmed) {
+		return err
+	}
+	if m.sessionActivityAdvancedSince(ctx, sessName, sendStartedAt) {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrSubmitUnconfirmed, err)
+}
+
+// sessionActivityAdvancedSince polls the provider's last-activity signal for
+// up to submitReconcileWindow, reporting whether it observed activity at or
+// after since. Used only to reconcile an otherwise-ambiguous submit outcome;
+// a provider that cannot report activity (zero time, or a persistent error)
+// leaves the outcome unresolved rather than being treated as proof either way.
+func (m *Manager) sessionActivityAdvancedSince(ctx context.Context, sessName string, since time.Time) bool {
+	deadline := time.Now().Add(submitReconcileWindow)
+	for {
+		if last, actErr := m.sp.GetLastActivity(sessName); actErr == nil && !last.IsZero() && !last.Before(since) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		if err := sleepWithContext(ctx, submitReconcilePollInterval); err != nil {
+			return false
+		}
+	}
 }
 
 func (m *Manager) nudgeContent(sessName string, content []runtime.ContentBlock, immediate bool) error {

@@ -3240,6 +3240,70 @@ func TestRecordQueuedNudgeFailureDeadLettersWhenTerminalBeadMarkFails(t *testing
 	}
 }
 
+// TestRecordQueuedNudgeFailureAlertsMailWhenTerminalBeadMarkFails covers
+// DEFECT 2 from gc-7jjy53: a dead-lettered nudge must surface to a reader --
+// city mail or a bead -- and never only to state.json. This reuses the exact
+// fixture from TestRecordQueuedNudgeFailureDeadLettersWhenTerminalBeadMarkFails
+// (bead-mark write fails, so the shadow bead never reaches terminal state),
+// but where that test only asserts a stderr warning was printed (invisible to
+// anything not watching this process's stderr in real time, i.e. exactly the
+// "state.json only" silent-loss failure mode the bead describes), this test
+// asserts a reader actually has something to find: a mail message addressed
+// to the nudge's target agent recording the dead-letter. On the unfixed code
+// this fails because recordQueuedNudgeFailureDetailed only logs a warning
+// when the terminal bead-mark fails; it never notifies anyone.
+func TestRecordQueuedNudgeFailureAlertsMailWhenTerminalBeadMarkFails(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	now := time.Now().Add(-1 * time.Minute)
+
+	store := &failingTerminalNudgeStore{MemStore: beads.NewMemStore()}
+	item := newQueuedNudgeWithOptions("worker", "stale fenced reminder", "session", now, queuedNudgeOptions{
+		SessionID:         "sess-1",
+		ContinuationEpoch: "1",
+	})
+	if err := enqueueQueuedNudgeWithStore(dir, beads.NudgesStore{Store: store}, item); err != nil {
+		t.Fatalf("enqueueQueuedNudgeWithStore: %v", err)
+	}
+	itemBead, ok, err := nudgeFrontDoor(beads.NudgesStore{Store: store}).Find(item.ID)
+	if err != nil || !ok {
+		t.Fatalf("nudgeFrontDoor.Find = %v, ok=%v", err, ok)
+	}
+	store.failID = itemBead.BeadID
+
+	if _, err := claimDueWorkerNudges(dir); err != nil {
+		t.Fatalf("claimDueQueuedNudges: %v", err)
+	}
+
+	var warnings bytes.Buffer
+	origWarn := nudgeWarningWriter
+	nudgeWarningWriter = &warnings
+	defer func() { nudgeWarningWriter = origWarn }()
+
+	if err := recordQueuedNudgeFailureWithStore(dir, beads.NudgesStore{Store: store}, []string{item.ID}, errNudgeSessionFenceMismatch, time.Now()); err != nil {
+		t.Fatalf("recordQueuedNudgeFailureWithStore: %v", err)
+	}
+
+	mp := newMailProvider(store)
+	inbox, err := mp.Inbox(item.Agent)
+	if err != nil {
+		t.Fatalf("Inbox(%q): %v", item.Agent, err)
+	}
+	if len(inbox) == 0 {
+		t.Fatalf("inbox for %q is empty; a dead-lettered nudge whose shadow bead could not be marked terminal must still surface as city mail so a reader is not silently blind to it", item.Agent)
+	}
+	found := false
+	for _, msg := range inbox {
+		if strings.Contains(msg.Subject, item.ID) || strings.Contains(msg.Body, item.ID) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("inbox for %q = %+v, want a message referencing dead-lettered nudge %s", item.Agent, inbox, item.ID)
+	}
+}
+
 func TestCmdNudgePollSurvivesTransientObserveErrors(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
