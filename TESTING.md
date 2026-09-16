@@ -240,6 +240,14 @@ skips likewise require an equipped CI execution or an explicit waiver. Do not
 weaken assertions, increase sleeps, or broaden retries to hide an unknown race.
 Remove redundant tests; repair unique tests.
 
+A skip is not a pass. A test that skips did not execute, so its outcome is
+evidence about the gate, not about the behavior under test. Do not close a bug
+as fixed, and do not report a lane as green, because the test that would have
+caught it now skips. When a skip is the observed outcome the disposition is the
+waiver and its tracking owner, not the absence of a failure. Gate on a count of
+tests that actually ran, never on an exit code: a skipped opt-in tier prints
+PASS and exits 0, and so does a binary that does not contain the test at all.
+
 ## Timing objectives and resource ratchets
 
 Test performance claims require evidence. For a focused change, run the test
