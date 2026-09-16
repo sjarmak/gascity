@@ -1612,3 +1612,105 @@ func TestFormulaCookAttachHelpDoesNotClaimParentChild(t *testing.T) {
 		t.Fatalf("gc formula cook --help does not clarify that --attach is not a parent-child relationship; Long=%q", cmd.Long)
 	}
 }
+
+// TestExistingFormulaCookGraphV2RootFindsWispTierRoot pins the gc-7sxa cook-path
+// tier-asymmetry fix: a graph.v2 root materialized in the wisps tier (e.g. a
+// vapor-phase formula run) must still be found by its root key, exactly as the
+// sling counterparts (internal/sling/sling.go) already do via
+// beads.WithBothTiers. Before the fix, this lookup used TierIssues only and
+// would miss the wisp root, letting `gc formula cook --attach` re-cook a
+// duplicate instead of reusing it.
+func TestExistingFormulaCookGraphV2RootFindsWispTierRoot(t *testing.T) {
+	store := beads.NewMemStore()
+	const rootKey = "root-key-wisp-1"
+
+	root, err := store.Create(beads.Bead{Title: "wisp root", Ephemeral: true})
+	if err != nil {
+		t.Fatalf("create wisp root: %v", err)
+	}
+	if err := store.SetMetadata(root.ID, beadmeta.Graphv2RootKeyMetadataKey, rootKey); err != nil {
+		t.Fatalf("stamp root key: %v", err)
+	}
+
+	recipe := &formula.Recipe{
+		Steps: []formula.RecipeStep{
+			{ID: "mol-x", Metadata: map[string]string{beadmeta.Graphv2RootKeyMetadataKey: rootKey}},
+		},
+	}
+
+	result, err := existingFormulaCookGraphV2Root(store, recipe)
+	if err != nil {
+		t.Fatalf("existingFormulaCookGraphV2Root() error = %v", err)
+	}
+	if result == nil {
+		t.Fatalf("existingFormulaCookGraphV2Root() = nil, want the wisp-tier root %s", root.ID)
+	}
+	if result.RootID != root.ID {
+		t.Fatalf("existingFormulaCookGraphV2Root() RootID = %s, want %s", result.RootID, root.ID)
+	}
+}
+
+// TestFormulaCookLiveInputConvoyGraphRootsFindsWispTierRoot pins the same
+// gc-7sxa tier-asymmetry fix for the input-convoy live-root scan: a graph.v2
+// root living in the wisps tier must be counted against its input convoy so
+// duplicate-root detection still fires.
+func TestFormulaCookLiveInputConvoyGraphRootsFindsWispTierRoot(t *testing.T) {
+	store := beads.NewMemStore()
+	const inputConvoyID = "convoy-1"
+
+	root, err := store.Create(beads.Bead{Title: "wisp root", Ephemeral: true})
+	if err != nil {
+		t.Fatalf("create wisp root: %v", err)
+	}
+	if err := store.SetMetadata(root.ID, beadmeta.InputConvoyIDMetadataKey, inputConvoyID); err != nil {
+		t.Fatalf("stamp input convoy id: %v", err)
+	}
+	if err := store.SetMetadata(root.ID, beadmeta.FormulaContractMetadataKey, beadmeta.FormulaContractGraphV2); err != nil {
+		t.Fatalf("stamp formula contract: %v", err)
+	}
+
+	roots, err := formulaCookLiveInputConvoyGraphRoots(store, inputConvoyID, "")
+	if err != nil {
+		t.Fatalf("formulaCookLiveInputConvoyGraphRoots() error = %v", err)
+	}
+	if len(roots) != 1 || roots[0].ID != root.ID {
+		t.Fatalf("formulaCookLiveInputConvoyGraphRoots() = %+v, want only the wisp-tier root %s", roots, root.ID)
+	}
+}
+
+// TestCloseFormulaCookFailedGraphV2RootsClosesWispTierRoot pins the same
+// gc-7sxa tier-asymmetry fix for failed-root cleanup: a failed graph.v2 root
+// materialized in the wisps tier must still be found and closed by root key.
+func TestCloseFormulaCookFailedGraphV2RootsClosesWispTierRoot(t *testing.T) {
+	store := beads.NewMemStore()
+	const rootKey = "root-key-wisp-2"
+
+	root, err := store.Create(beads.Bead{Title: "wisp root", Ephemeral: true})
+	if err != nil {
+		t.Fatalf("create wisp root: %v", err)
+	}
+	if err := store.SetMetadata(root.ID, beadmeta.Graphv2RootKeyMetadataKey, rootKey); err != nil {
+		t.Fatalf("stamp root key: %v", err)
+	}
+	if err := store.SetMetadata(root.ID, beadmeta.MoleculeFailedMetadataKey, "true"); err != nil {
+		t.Fatalf("stamp molecule failed: %v", err)
+	}
+
+	recipe := &formula.Recipe{
+		Steps: []formula.RecipeStep{
+			{ID: "mol-x", Metadata: map[string]string{beadmeta.Graphv2RootKeyMetadataKey: rootKey}},
+		},
+	}
+
+	if err := closeFormulaCookFailedGraphV2Roots(store, recipe); err != nil {
+		t.Fatalf("closeFormulaCookFailedGraphV2Roots() error = %v", err)
+	}
+
+	got, err := store.Get(root.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", root.ID, err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("wisp-tier failed root %s status = %q, want closed", root.ID, got.Status)
+	}
+}
