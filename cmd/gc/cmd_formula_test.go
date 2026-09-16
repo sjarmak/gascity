@@ -1612,3 +1612,91 @@ func TestFormulaCookAttachHelpDoesNotClaimParentChild(t *testing.T) {
 		t.Fatalf("gc formula cook --help does not clarify that --attach is not a parent-child relationship; Long=%q", cmd.Long)
 	}
 }
+
+// TestFormulaCookGraphV2Lookups_SeeWispsTier pins the gc-7sxa fix: the three
+// cmd_formula.go graph.v2 root lookups (formulaCookLiveInputConvoyGraphRoots,
+// closeFormulaCookFailedGraphV2Roots, existingFormulaCookGraphV2Root) must pass
+// beads.WithBothTiers on their ListByMetadata calls, exactly like their
+// internal/sling/sling.go counterparts (closeFailedGraphV2RootsByKey,
+// existingGraphV2Root). Before the fix, a graph.v2 root materialized in the
+// wisps tier is invisible to these helpers, so `gc formula cook --attach`
+// would miss a live root the sling path would find, reintroducing
+// duplicate-root risk on the CLI cook path.
+func TestFormulaCookGraphV2Lookups_SeeWispsTier(t *testing.T) {
+	const rootKey = "graphv2-root:wisps-tier-test"
+	const inputConvoyID = "convoy-wisps-tier-test"
+
+	newWispRoot := func(t *testing.T, store *beads.MemStore, extra map[string]string) beads.Bead {
+		t.Helper()
+		metadata := map[string]string{
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+			beadmeta.Graphv2RootKeyMetadataKey:  rootKey,
+			beadmeta.InputConvoyIDMetadataKey:   inputConvoyID,
+		}
+		for k, v := range extra {
+			metadata[k] = v
+		}
+		root, err := store.Create(beads.Bead{
+			Title:     "graph.v2 root (wisps tier)",
+			Ephemeral: true,
+			Metadata:  metadata,
+		})
+		if err != nil {
+			t.Fatalf("create wisps-tier graph.v2 root: %v", err)
+		}
+		return root
+	}
+
+	t.Run("formulaCookLiveInputConvoyGraphRoots", func(t *testing.T) {
+		store := beads.NewMemStore()
+		root := newWispRoot(t, store, nil)
+
+		roots, err := formulaCookLiveInputConvoyGraphRoots(store, inputConvoyID, "")
+		if err != nil {
+			t.Fatalf("formulaCookLiveInputConvoyGraphRoots: %v", err)
+		}
+		if len(roots) != 1 || roots[0].ID != root.ID {
+			t.Fatalf("formulaCookLiveInputConvoyGraphRoots missed wisps-tier root %s; got %+v", root.ID, roots)
+		}
+	})
+
+	t.Run("existingFormulaCookGraphV2Root", func(t *testing.T) {
+		store := beads.NewMemStore()
+		root := newWispRoot(t, store, nil)
+
+		recipe := &formula.Recipe{Steps: []formula.RecipeStep{
+			{ID: "root", Metadata: map[string]string{beadmeta.Graphv2RootKeyMetadataKey: rootKey}},
+		}}
+
+		result, err := existingFormulaCookGraphV2Root(store, recipe)
+		if err != nil {
+			t.Fatalf("existingFormulaCookGraphV2Root: %v", err)
+		}
+		if result == nil || result.RootID != root.ID {
+			t.Fatalf("existingFormulaCookGraphV2Root missed wisps-tier root %s; got %+v", root.ID, result)
+		}
+	})
+
+	t.Run("closeFormulaCookFailedGraphV2Roots", func(t *testing.T) {
+		store := beads.NewMemStore()
+		root := newWispRoot(t, store, map[string]string{
+			beadmeta.MoleculeFailedMetadataKey: "true",
+		})
+
+		recipe := &formula.Recipe{Steps: []formula.RecipeStep{
+			{ID: "root", Metadata: map[string]string{beadmeta.Graphv2RootKeyMetadataKey: rootKey}},
+		}}
+
+		if err := closeFormulaCookFailedGraphV2Roots(store, recipe); err != nil {
+			t.Fatalf("closeFormulaCookFailedGraphV2Roots: %v", err)
+		}
+
+		got, err := store.Get(root.ID)
+		if err != nil {
+			t.Fatalf("re-reading wisps-tier root: %v", err)
+		}
+		if got.Status != "closed" {
+			t.Fatalf("closeFormulaCookFailedGraphV2Roots did not close wisps-tier failed root %s; got status=%q", root.ID, got.Status)
+		}
+	})
+}
