@@ -308,17 +308,24 @@ LINT_FLAGS ?=
 QUALITY_GATE_GOFLAGS = $$(go env GOFLAGS | sed -E 's/(^|[[:space:]])-mod=[^[:space:]]+//g') -mod=readonly
 CI_STATIC_SELECT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))scripts/ci-static-select
 CI_STATIC_GO ?= go
+# gc-vrva1q: golangci-lint over the whole repo (or even just ./cmd/gc alone)
+# has been measured up to ~9.85 GiB RSS. On a host with exhausted swap that
+# overshoot reaches the OOM killer directly and takes unrelated processes
+# with it (dr-krxbg). Every invocation below routes through this wrapper,
+# which applies GOMEMLIMIT/--concurrency and a hard systemd-run cgroup
+# MemoryMax ceiling — see scripts/lint-run.sh and scripts/lib/lint-mem-cap.sh.
+LINT_RUN := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))scripts/lint-run.sh
 
 ## lint: run full-repo golangci-lint
 lint: lint-full
 
 ## lint-full: run golangci-lint across all packages
 lint-full: $(GOLANGCI_LINT)
-	GOFLAGS="$(QUALITY_GATE_GOFLAGS)" $(GOLANGCI_LINT) run $(LINT_FLAGS) ./...
+	GOFLAGS="$(QUALITY_GATE_GOFLAGS)" $(LINT_RUN) $(GOLANGCI_LINT) run $(LINT_FLAGS) ./...
 
 ## lint-new: run golangci-lint for issues introduced since LINT_BASE
 lint-new: $(GOLANGCI_LINT)
-	GOFLAGS="$(QUALITY_GATE_GOFLAGS)" $(GOLANGCI_LINT) run $(LINT_FLAGS) --new-from-merge-base=$(LINT_BASE) --whole-files ./...
+	GOFLAGS="$(QUALITY_GATE_GOFLAGS)" $(LINT_RUN) $(GOLANGCI_LINT) run $(LINT_FLAGS) --new-from-merge-base=$(LINT_BASE) --whole-files ./...
 
 ## lint-changed: run golangci-lint only for packages touched by changed Go files
 lint-changed: $(GOLANGCI_LINT)
@@ -360,23 +367,23 @@ lint-changed: $(GOLANGCI_LINT)
 		exit 0; \
 	fi; \
 	echo "lint-changed: $$(printf '%s\n' "$$pkgs" | tr '\n' ' ')"; \
-	$(GOLANGCI_LINT) run $(LINT_FLAGS) $$pkgs
+	$(LINT_RUN) $(GOLANGCI_LINT) run $(LINT_FLAGS) $$pkgs
 
 ## lint-affected: lint packages affected by changed Go build inputs or embedded files
 lint-affected: $(GOLANGCI_LINT)
-	@GOFLAGS="$(QUALITY_GATE_GOFLAGS)" "$(CI_STATIC_SELECT)" lint-affected "$(GOLANGCI_LINT)" "$(CI_STATIC_GO)" $(LINT_FLAGS)
+	@GOFLAGS="$(QUALITY_GATE_GOFLAGS)" GC_LINT_RUN_WRAPPER="$(LINT_RUN)" "$(CI_STATIC_SELECT)" lint-affected "$(GOLANGCI_LINT)" "$(CI_STATIC_GO)" $(LINT_FLAGS)
 
 ## fmt-check: fail if formatting would change files
 fmt-check: $(GOLANGCI_LINT)
-	GOFLAGS="$(QUALITY_GATE_GOFLAGS)" $(GOLANGCI_LINT) fmt --diff ./...
+	GOFLAGS="$(QUALITY_GATE_GOFLAGS)" $(LINT_RUN) $(GOLANGCI_LINT) fmt --diff ./...
 
 ## fmt-check-changed: fail if formatting would change a regular changed Go file
 fmt-check-changed: $(GOLANGCI_LINT)
-	@GOFLAGS="$(QUALITY_GATE_GOFLAGS)" "$(CI_STATIC_SELECT)" fmt-check-changed "$(GOLANGCI_LINT)"
+	@GOFLAGS="$(QUALITY_GATE_GOFLAGS)" GC_LINT_RUN_WRAPPER="$(LINT_RUN)" "$(CI_STATIC_SELECT)" fmt-check-changed "$(GOLANGCI_LINT)"
 
 ## fmt: auto-fix formatting
 fmt: $(GOLANGCI_LINT)
-	$(GOLANGCI_LINT) fmt ./...
+	$(LINT_RUN) $(GOLANGCI_LINT) fmt ./...
 
 ## vet: run go vet
 vet:

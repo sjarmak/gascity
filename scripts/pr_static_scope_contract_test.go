@@ -997,7 +997,27 @@ func (f prStaticScopeFixture) resetCalls(t *testing.T) {
 
 func (f prStaticScopeFixture) calls(t *testing.T) [][]string {
 	t.Helper()
-	return readFramedCalls(t, f.lintLog, "golangci")
+	// gc-vrva1q: scripts/lint-run.sh injects "--concurrency N" as a memory
+	// safety lever ahead of every real golangci-lint "run" invocation. Strip
+	// it here so this file's assertions stay about package-scoping, the
+	// contract they actually test, not about the lever's exact value.
+	return stripLintConcurrencyFlag(readFramedCalls(t, f.lintLog, "golangci"))
+}
+
+func stripLintConcurrencyFlag(calls [][]string) [][]string {
+	stripped := make([][]string, len(calls))
+	for i, call := range calls {
+		filtered := make([]string, 0, len(call))
+		for j := 0; j < len(call); j++ {
+			if call[j] == "--concurrency" && j+1 < len(call) {
+				j++
+				continue
+			}
+			filtered = append(filtered, call[j])
+		}
+		stripped[i] = filtered
+	}
+	return stripped
 }
 
 func (f prStaticScopeFixture) goCalls(t *testing.T) [][]string {

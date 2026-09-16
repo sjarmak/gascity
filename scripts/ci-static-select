@@ -334,6 +334,18 @@ def affected_package_args(
     return sorted(arg_by_import[import_path] for import_path in affected)
 
 
+def lint_argv(lint_tool: str, rest: list[str]) -> list[str]:
+    # gc-vrva1q: golangci-lint's measured peak (up to ~9.85 GiB RSS) can take
+    # a swap-exhausted host down with it. GC_LINT_RUN_WRAPPER points at
+    # scripts/lint-run.sh, which applies GOMEMLIMIT/--concurrency and a hard
+    # systemd-run cgroup MemoryMax ceiling; the Makefile always sets it, so
+    # this only runs unwrapped when invoked directly outside `make`.
+    wrapper = os.environ.get("GC_LINT_RUN_WRAPPER")
+    if wrapper:
+        return [wrapper, lint_tool, *rest]
+    return [lint_tool, *rest]
+
+
 def run_tool(args: list[str]) -> int:
     try:
         return subprocess.run(args).returncode
@@ -348,7 +360,7 @@ def run_static_checks(
     lint_flags: list[str],
     packages: list[str],
 ) -> int:
-    lint_result = run_tool([lint_tool, "run", *lint_flags, *packages])
+    lint_result = run_tool(lint_argv(lint_tool, ["run", *lint_flags, *packages]))
     if lint_result != 0:
         return lint_result
     return run_tool([go_tool, "vet", *packages])
@@ -392,11 +404,11 @@ def fmt_check_changed(tool: str) -> int:
         )
     except SelectionError as error:
         print(f"fmt-check-changed: selecting full repository: {error}", file=sys.stderr)
-        return run_tool([tool, "fmt", "--diff", "./..."])
+        return run_tool(lint_argv(tool, ["fmt", "--diff", "./..."]))
     if not paths:
         print("fmt-check-changed: no changed existing Go files")
         return 0
-    return run_tool([tool, "fmt", "--diff", "--", *paths])
+    return run_tool(lint_argv(tool, ["fmt", "--diff", "--", *paths]))
 
 
 def is_regular_file(path: str) -> bool:
