@@ -1004,9 +1004,17 @@ func (f prStaticScopeFixture) calls(t *testing.T) [][]string {
 	return stripLintConcurrencyFlag(readFramedCalls(t, f.lintLog, "golangci"))
 }
 
+// stripLintConcurrencyFlag strips only the "--concurrency <value>" pair that
+// lint-run.sh injects for "run" invocations. golangci-lint's "fmt"
+// subcommand rejects --concurrency, so leaving it unstripped on a "fmt" call
+// keeps the test able to catch a bug that mistakenly injects it there.
 func stripLintConcurrencyFlag(calls [][]string) [][]string {
 	stripped := make([][]string, len(calls))
 	for i, call := range calls {
+		if len(call) == 0 || call[0] != "run" {
+			stripped[i] = call
+			continue
+		}
 		filtered := make([]string, 0, len(call))
 		for j := 0; j < len(call); j++ {
 			if call[j] == "--concurrency" && j+1 < len(call) {

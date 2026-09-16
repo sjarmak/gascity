@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# lint-mem-cap-test — self-test for scripts/lib/lint-mem-cap.sh and
+# scripts/lint-run.sh (gc-vrva1q).
+#
+# Exercises the memory-fence decision matrix with a fake systemd-run on a
+# fully controlled PATH: an accepted cap actually applies and propagates a
+# real kill's exit status; a value systemd rejects is a hard failure that
+# never runs the wrapped command; a missing/unreachable systemd manager
+# warns on stderr and falls back to plain execution; the explicit opt-out
+# stays silent. Also covers lint-run.sh's own argv construction: GOMEMLIMIT
+# reaches the child, --concurrency is injected only for "run" and never for
+# "fmt", and a caller-supplied --concurrency/-j is never overridden.
+#
+# Run directly:    scripts/lint-mem-cap-test
+# Run via go test: go test ./scripts -run TestLintMemCap
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+mem_cap_lib="$repo_root/scripts/lib/lint-mem-cap.sh"
+lint_run="$repo_root/scripts/lint-run.sh"
+
+work="$(mktemp -d "${TMPDIR:-/var/tmp}/gc-lint-mem-cap-test.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+
+failures=0
+fail() {
+  echo "FAIL: $*" >&2
+  failures=$((failures + 1))
+}
+
+for f in "$mem_cap_lib" "$lint_run"; do
+  [[ -f "$f" ]] || { echo "FAIL: missing $f" >&2; exit 1; }
+done
+
+if shellcheck --version >/dev/null 2>&1; then
+  if ! shellcheck -e SC2119,SC2120,SC1091 "$mem_cap_lib" "$lint_run" "${BASH_SOURCE[0]}"; then
+    fail "shellcheck reported issues"
+  fi
+elif command -v shellcheck >/dev/null 2>&1; then
+  echo "warning: shellcheck on PATH but not runnable (untrusted mise shim?); skipping shell lint" >&2
+else
+  echo "note: shellcheck not installed; skipping lint" >&2
+fi
+
+# ── fake systemd-run variants ────────────────────────────────────────────
+
+# Accepts any MemoryMax matching systemd's own grammar (digits + K/M/G/T,
+# no "i", no trailing "B"); rejects everything else, including Go's GiB
+# spelling — mirrors real systemd's behavior closely enough to exercise the
+# bad-value branch without a live systemd manager.
+write_fake_systemd_run() {
+  local path="$1" log="$2"
+  cat >"$path" <<FAKE
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "\$*" >>"$log"
+mem=""
+args=("\$@")
+for ((i=0; i<\${#args[@]}; i++)); do
+  if [[ "\${args[i]}" == -p && "\${args[i+1]}" == MemoryMax=* ]]; then
+    mem="\${args[i+1]#MemoryMax=}"
+  fi
+done
+if [[ -n "\$mem" && ! "\$mem" =~ ^[0-9]+[KMGT]?\$ ]]; then
+  echo "fake systemd-run: invalid MemoryMax value: \$mem" >&2
+  exit 1
+fi
+while [[ \$# -gt 0 && "\$1" != "--" ]]; do shift; done
+if [[ \$# -gt 0 ]]; then shift; fi
+exec "\$@"
+FAKE
+  chmod +x "$path"
+}
+
+# A fake systemd-run that actually enforces a byte ceiling against a
+# growing allocator, so the "cap really kills" path is proven rather than
+# just argv-checked: it lets the child run only up to a fixed number of
+# reads of its stdout progress log before SIGKILLing it.
+write_fake_systemd_run_enforcing() {
+  local path="$1" log="$2" max_lines="$3"
+  cat >"$path" <<FAKE
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "\$*" >>"$log"
+while [[ \$# -gt 0 && "\$1" != "--" ]]; do shift; done
+if [[ \$# -gt 0 ]]; then shift; fi
+"\$@" &
+child=\$!
+count=0
+while kill -0 "\$child" 2>/dev/null; do
+  count=\$((count + 1))
+  if [[ "\$count" -ge $max_lines ]]; then
+    kill -KILL "\$child" 2>/dev/null || true
+    wait "\$child" 2>/dev/null || true
+    exit 137
+  fi
+  sleep 0.05
+done
+wait "\$child"
+FAKE
+  chmod +x "$path"
+}
+
+write_fake_systemd_run_down() {
+  local path="$1" log="$2"
+  cat >"$path" <<FAKE
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "\$*" >>"$log"
+echo "Failed to connect to bus: No medium found" >&2
+exit 1
+FAKE
+  chmod +x "$path"
+}
+
+write_growing_hog() {
+  local path="$1"
+  cat >"$path" <<'FAKE'
+#!/usr/bin/env bash
+set -euo pipefail
+i=0
+while true; do
+  i=$((i + 1))
+  echo "tick $i"
+  sleep 0.05
+done
+FAKE
+  chmod +x "$path"
+}
+
+write_argv_echo_lint() {
+  local path="$1" log="$2"
+  cat >"$path" <<FAKE
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$log"
+FAKE
+  chmod +x "$path"
+}
+
+minimal_toolbox() {
+  local dir="$1"
+  mkdir -p "$dir"
+  local tool
+  for tool in bash sh cat true false grep sed cut tr sleep env kill touch dirname mktemp; do
+    ln -sf "$(type -P "$tool")" "$dir/$tool" 2>/dev/null || true
+  done
+}
+
+# ── C1: an accepted cap value really kills an overshoot ─────────────────
+scenario="$work/enforcing"
+mkdir -p "$scenario"
+sdr_log="$scenario/systemd-run.log"
+: >"$sdr_log"
+minimal_toolbox "$scenario/bin"
+write_fake_systemd_run_enforcing "$scenario/bin/systemd-run" "$sdr_log" 5
+write_growing_hog "$scenario/hog"
+
+set +e
+out="$(env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX=300M \
+  bash -c "source '$mem_cap_lib'; gc_lint_mem_cap_exec '$scenario/hog'" 2>&1)"
+status=$?
+set -e
+if [[ "$status" -ne 137 ]]; then
+  fail "C1: expected exit 137 from an enforced overshoot, got $status: $out"
+fi
+# gc_lint_mem_cap_available makes two probe calls (manager-reachable,
+# then value-accepted) before the real capped exec: three total.
+if [[ "$(wc -l <"$sdr_log" | tr -d '[:space:]')" -ne 3 ]]; then
+  fail "C1: expected exactly three systemd-run invocations (2 probes + 1 real), got $(cat "$sdr_log")"
+fi
+
+# ── C2: a value systemd rejects is a hard failure, command never runs ───
+scenario="$work/bad-value"
+mkdir -p "$scenario"
+sdr_log="$scenario/systemd-run.log"
+: >"$sdr_log"
+minimal_toolbox "$scenario/bin"
+write_fake_systemd_run "$scenario/bin/systemd-run" "$sdr_log"
+marker="$scenario/ran"
+cat >"$scenario/hog" <<FAKE
+#!/usr/bin/env bash
+touch "$marker"
+FAKE
+chmod +x "$scenario/hog"
+
+for bad in 12GiB 12GB 12Gi 12g bogus; do
+  set +e
+  out="$(env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX="$bad" \
+    bash -c "source '$mem_cap_lib'; gc_lint_mem_cap_exec '$scenario/hog'" 2>&1)"
+  status=$?
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    fail "C2: GC_LINT_MEMORY_MAX=$bad was accepted (silently uncapped); want a hard failure"
+  fi
+  if [[ -e "$marker" ]]; then
+    fail "C2: GC_LINT_MEMORY_MAX=$bad let the wrapped command run"
+    rm -f "$marker"
+  fi
+  if ! grep -qi "rejected by systemd" <<<"$out"; then
+    fail "C2: GC_LINT_MEMORY_MAX=$bad did not report a rejection: $out"
+  fi
+done
+
+# accepted spellings must still work through the same probe.
+for good in 7G 300M 1T; do
+  set +e
+  out="$(env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX="$good" \
+    bash -c "source '$mem_cap_lib'; gc_lint_mem_cap_exec '$scenario/hog'" 2>&1)"
+  status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    fail "C2: GC_LINT_MEMORY_MAX=$good was rejected; want accepted: $out"
+  fi
+  if [[ ! -e "$marker" ]]; then
+    fail "C2: GC_LINT_MEMORY_MAX=$good did not run the wrapped command"
+  fi
+  rm -f "$marker"
+done
+
+# ── C3: no responsive systemd manager warns and falls back to plain ─────
+scenario="$work/no-manager"
+mkdir -p "$scenario"
+sdr_log="$scenario/systemd-run.log"
+: >"$sdr_log"
+minimal_toolbox "$scenario/bin"
+write_fake_systemd_run_down "$scenario/bin/systemd-run" "$sdr_log"
+cat >"$scenario/hog" <<'FAKE'
+#!/usr/bin/env bash
+echo "hog ran"
+FAKE
+chmod +x "$scenario/hog"
+
+set +e
+out="$(env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX=300M \
+  bash -c "source '$mem_cap_lib'; gc_lint_mem_cap_exec '$scenario/hog'" 2>&1)"
+status=$?
+set -e
+if [[ "$status" -ne 0 ]]; then
+  fail "C3: expected the fallback to run and exit 0, got $status: $out"
+fi
+if ! grep -qi "WARNING" <<<"$out"; then
+  fail "C3: no-manager fallback did not warn: $out"
+fi
+if ! grep -qF "hog ran" <<<"$out"; then
+  fail "C3: no-manager fallback did not run the wrapped command: $out"
+fi
+
+# ── C4: explicit opt-out stays silent ────────────────────────────────────
+set +e
+out="$(env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX=300M GC_LINT_NO_MEM_CAP=1 \
+  bash -c "source '$mem_cap_lib'; gc_lint_mem_cap_exec '$scenario/hog'" 2>&1)"
+status=$?
+set -e
+if [[ "$status" -ne 0 ]]; then
+  fail "C4: opt-out fallback did not run cleanly, got $status: $out"
+fi
+if grep -qi "WARNING" <<<"$out"; then
+  fail "C4: opt-out fallback warned; want silent: $out"
+fi
+
+# ── C5: lint-run.sh argv construction ────────────────────────────────────
+scenario="$work/argv"
+mkdir -p "$scenario"
+sdr_log="$scenario/systemd-run.log"
+: >"$sdr_log"
+minimal_toolbox "$scenario/bin"
+write_fake_systemd_run "$scenario/bin/systemd-run" "$sdr_log"
+lint_log="$scenario/lint.log"
+: >"$lint_log"
+write_argv_echo_lint "$scenario/golangci-lint" "$lint_log"
+
+# shellcheck disable=SC2120
+run_lint() {
+  : >"$lint_log"
+  env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX=7G "$@" \
+    "$lint_run" "$scenario/golangci-lint" "${lint_args[@]}"
+}
+
+lint_args=(run ./...)
+run_lint
+if [[ "$(cat "$lint_log")" != "run --concurrency 1 ./..." ]]; then
+  fail "C5: run with no caller concurrency = $(cat "$lint_log"), want 'run --concurrency 1 ./...'"
+fi
+
+lint_args=(run --concurrency 4 ./...)
+run_lint
+if [[ "$(cat "$lint_log")" != "run --concurrency 4 ./..." ]]; then
+  fail "C5: caller-supplied --concurrency was overridden: $(cat "$lint_log")"
+fi
+
+lint_args=(run -j4 ./...)
+run_lint
+if [[ "$(cat "$lint_log")" != "run -j4 ./..." ]]; then
+  fail "C5: caller-supplied -j was overridden: $(cat "$lint_log")"
+fi
+
+lint_args=(fmt --diff ./...)
+run_lint
+if [[ "$(cat "$lint_log")" == *"--concurrency"* ]]; then
+  fail "C5: fmt received --concurrency, which golangci-lint fmt rejects: $(cat "$lint_log")"
+fi
+if [[ "$(cat "$lint_log")" != "fmt --diff ./..." ]]; then
+  fail "C5: fmt argv unexpected: $(cat "$lint_log")"
+fi
+
+# GOMEMLIMIT must reach the child.
+write_argv_echo_lint "$scenario/golangci-lint" "$lint_log"
+cat >"$scenario/golangci-lint" <<FAKE
+#!/usr/bin/env bash
+printf 'GOMEMLIMIT=%s\n' "\${GOMEMLIMIT:-<unset>}" >>"$lint_log"
+FAKE
+chmod +x "$scenario/golangci-lint"
+lint_args=(run ./...)
+: >"$lint_log"
+env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX=7G GC_LINT_GOMEMLIMIT=4GiB \
+  "$lint_run" "$scenario/golangci-lint" "${lint_args[@]}"
+if [[ "$(cat "$lint_log")" != "GOMEMLIMIT=4GiB" ]]; then
+  fail "C5: GOMEMLIMIT did not reach the child: $(cat "$lint_log")"
+fi
+
+if [[ "$failures" -ne 0 ]]; then
+  echo "lint-mem-cap-test: $failures failure(s)" >&2
+  exit 1
+fi
+echo "lint-mem-cap-test: all scenarios passed"
