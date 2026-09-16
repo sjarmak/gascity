@@ -1568,6 +1568,67 @@ func TestRigBDSplitStoreCheck_InheritedRigTreatsLocalReposAsLegacy(t *testing.T)
 	}
 }
 
+// TestRigBDSplitStoreCheck_InheritedRigWithSoloLocalRepoWarns reproduces the
+// gc-kuq1gn incident: a rig resolves endpoint_origin=inherited_city (it reads
+// and writes through the canonical dolt endpoint) but still carries its own
+// .beads/dolt repo, with no .beads/embeddeddolt directory at all. Before the
+// fix, activeBDStore reported activeStore="" for this origin and
+// unreadStoreBesideTheActiveOne bailed out on that "" via its default case,
+// so the check reported "no legacy split store detected" while the rig's
+// local repo silently held commits canonical never received (492 commits /
+// 107 issues, per dr-mj4u9). This must fail (report non-ok) on the unfixed
+// check.
+func TestRigBDSplitStoreCheck_InheritedRigWithSoloLocalRepoWarns(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "mtg")
+	fs := fsys.OSFS{}
+	writeDoctorCanonicalConfig(t, fs, cityDir, contract.ConfigState{
+		IssuePrefix:    "gc",
+		EndpointOrigin: contract.EndpointOriginManagedCity,
+		EndpointStatus: contract.EndpointStatusVerified,
+	})
+	writeDoctorCanonicalMetadata(t, fs, cityDir, "hq")
+	writeDoctorCanonicalConfig(t, fs, rigDir, contract.ConfigState{
+		IssuePrefix:    "mt",
+		EndpointOrigin: contract.EndpointOriginInheritedCity,
+		EndpointStatus: contract.EndpointStatusVerified,
+	})
+	writeDoctorCanonicalMetadata(t, fs, rigDir, "mtg")
+	// One extra commit's worth of a local server-mode repo, with no
+	// .beads/embeddeddolt directory present at all.
+	writeDoltRepoMarker(t, filepath.Join(rigDir, ".beads", "dolt", "mtg"))
+
+	c := NewRigBDSplitStoreCheck(cityDir, config.Rig{Name: "mtg", Path: rigDir})
+	r := c.Run(&CheckContext{})
+	if r.Status == StatusOK {
+		t.Fatalf("status = OK, want non-ok; msg = %s", r.Message)
+	}
+	if !strings.Contains(r.Message, ".beads/dolt") || !strings.Contains(r.Message, "commits canonical lacks") {
+		t.Fatalf("message = %q, want it to flag the local repo as possibly holding commits canonical lacks", r.Message)
+	}
+}
+
+// TestRigBDSplitStoreCheck_ManagedCityOwnLocalRepoStillOK confirms the fix
+// does not flag the managed city's own .beads/dolt directory, which is the
+// canonical server's real data directory rather than drift.
+func TestRigBDSplitStoreCheck_ManagedCityOwnLocalRepoStillOK(t *testing.T) {
+	cityDir := t.TempDir()
+	fs := fsys.OSFS{}
+	writeDoctorCanonicalConfig(t, fs, cityDir, contract.ConfigState{
+		IssuePrefix:    "gc",
+		EndpointOrigin: contract.EndpointOriginManagedCity,
+		EndpointStatus: contract.EndpointStatusVerified,
+	})
+	writeDoctorCanonicalMetadata(t, fs, cityDir, "hq")
+	writeDoltRepoMarker(t, filepath.Join(cityDir, ".beads", "dolt", "hq"))
+
+	c := NewBDSplitStoreCheck(cityDir)
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusOK {
+		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
+	}
+}
+
 func TestRigBDSplitStoreCheck_BDBackedRigUnderFileCityUsesRigMetadata(t *testing.T) {
 	cityDir := setupCity(t, `[workspace]
 name = "demo"

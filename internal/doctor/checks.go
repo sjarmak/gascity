@@ -855,7 +855,7 @@ func (c *BDSplitStoreCheck) unreadStoreBesideTheActiveOne(beadsDir, serverDir, e
 	case "embeddeddolt":
 		inactiveStore, inactiveDir = "dolt", serverDir
 	default:
-		return nil
+		return c.inheritedEndpointLocalRepoDrift(activeSource, serverDir)
 	}
 	if !splitStoreDirExists(inactiveDir) {
 		return nil
@@ -875,6 +875,46 @@ func (c *BDSplitStoreCheck) unreadStoreBesideTheActiveOne(beadsDir, serverDir, e
 			activeStore, activeSource, inactiveStore, len(inactiveRepos)),
 		Details: splitStoreDetails(activeStore, activeSource, serverRepos, embeddedRepos),
 		FixHint: splitStoreFixHint(activeStore),
+	}
+}
+
+// inheritedEndpointLocalRepoDrift warns when a scope resolves to a remote
+// canonical Dolt endpoint it does not itself own (city_canonical, explicit,
+// or inherited_city) — meaning activeBDStore intentionally reports "" and
+// unreadStoreBesideTheActiveOne above never runs, because that function only
+// compares a *pair* of local directories — yet a local .beads/dolt repository
+// still exists on disk. That repo is a leftover, or still-running, local
+// server-mode store: something once pointed this scope at its own dolt
+// process before it was reconciled to inherit the canonical endpoint, or a
+// local dolt sql-server was started here directly. Because the scope
+// currently reads and writes through the canonical endpoint, this repo does
+// not receive new commits through the scope's normal path, so any commits
+// already in it are silently stuck: the scope looks HEALTHY while a rig-
+// local ledger drifts unseen. Managed-city scopes are excluded because a
+// managed city's own .beads/dolt directory is the canonical server's real
+// data directory, not drift.
+func (c *BDSplitStoreCheck) inheritedEndpointLocalRepoDrift(activeSource, serverDir string) *CheckResult {
+	if !strings.Contains(activeSource, "canonical endpoint_origin=") || strings.Contains(activeSource, "endpoint_origin=managed_city") {
+		return nil
+	}
+	if !splitStoreDirExists(serverDir) {
+		return nil
+	}
+	repos, err := doltReposUnder(serverDir)
+	if err != nil || len(repos) == 0 {
+		return nil
+	}
+	return &CheckResult{
+		Name:   c.Name(),
+		Status: StatusWarning,
+		Message: fmt.Sprintf(
+			"local dolt repo present under .beads/dolt despite %s (scope has no locally-active store): %d repo(s) found; it may hold commits canonical lacks",
+			activeSource, len(repos)),
+		Details: []string{
+			fmt.Sprintf(".beads/dolt repositories: %s", describeRepoList(repos)),
+			"recovery: read-only compare the local repo's head against canonical before deleting it (e.g. inspect a copy of the .dolt directory, never a live lock); if it holds commits canonical lacks, export and reconcile them first",
+		},
+		FixHint: "back up .beads/dolt, confirm it holds no commits missing from canonical, then remove the local directory so the scope reads only through the inherited endpoint",
 	}
 }
 
