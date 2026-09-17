@@ -10,7 +10,50 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/fsys"
+	"gopkg.in/yaml.v3"
 )
+
+// getStringFromDirNestedOnly mimics the read semantics of beads'
+// internal/config.GetStringFromDir fallback reader: it walks a parsed YAML
+// document as nested maps and does NOT treat a dotted key as a path (a flat
+// key literally named "dolt.auto-start" is invisible to it, and it never
+// reads the top-level document as anything but a mapping to descend into).
+// This stands in for a bd process that has not run gc's own
+// config.Initialize()/viper setup, such as cmd/bd/bootstrap.go before a
+// server mode decision is made.
+func getStringFromDirNestedOnly(t *testing.T, fs fsys.FS, path string, keyPath ...string) (string, bool) {
+	t.Helper()
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", path, err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("yaml.Unmarshal(%s): %v", path, err)
+	}
+	current := any(doc)
+	for _, key := range keyPath {
+		m, ok := current.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		current, ok = m[key]
+		if !ok {
+			return "", false
+		}
+	}
+	switch v := current.(type) {
+	case string:
+		return v, true
+	case bool:
+		if v {
+			return "true", true
+		}
+		return "false", true
+	default:
+		return "", false
+	}
+}
 
 func TestConfigHasEndpointAuthority(t *testing.T) {
 	cases := []struct {
@@ -112,7 +155,7 @@ func TestEnsureCanonicalConfigCreatesManagedShape(t *testing.T) {
 	for _, needle := range []string{
 		"issue_prefix: gc",
 		"issue-prefix: gc",
-		"dolt.auto-start: false",
+		"auto-start: false",
 		"export.auto: false",
 		"backup.enabled: false",
 		"dolt:",
@@ -123,6 +166,16 @@ func TestEnsureCanonicalConfigCreatesManagedShape(t *testing.T) {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("config missing %q:\n%s", needle, text)
 		}
+	}
+	if strings.Contains(text, "dolt.auto-start") {
+		t.Fatalf("config should write dolt.auto-start nested, not flat:\n%s", text)
+	}
+	autoStartDisabled, err := ReadAutoStartDisabled(fs, path)
+	if err != nil {
+		t.Fatalf("ReadAutoStartDisabled() error = %v", err)
+	}
+	if !autoStartDisabled {
+		t.Fatalf("ReadAutoStartDisabled() = false, want true")
 	}
 	dolt, ok, err := ReadDoltConfig(fs, path)
 	if err != nil {
@@ -228,7 +281,7 @@ func TestEnsureCanonicalConfigCollapsesDuplicateManagedKeys(t *testing.T) {
 		"issue-prefix: gc",
 		"gc.endpoint_origin: managed_city",
 		"gc.endpoint_status: verified",
-		"dolt.auto-start: false",
+		"  auto-start: false",
 	} {
 		if count := countLineOccurrences(text, needle); count != 1 {
 			t.Fatalf("config should contain exactly one %q, found %d:%c%s", needle, count, 10, text)
@@ -240,6 +293,7 @@ func TestEnsureCanonicalConfigCollapsesDuplicateManagedKeys(t *testing.T) {
 		"gc.endpoint_origin: explicit",
 		"gc.endpoint_status: unverified",
 		"dolt.auto-start: true",
+		"dolt.auto-start:",
 	} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("config should scrub stale duplicate %q:%c%s", forbidden, 10, text)
@@ -464,7 +518,7 @@ func TestEnsureCanonicalConfigCanonicalizesFlatDoltDisableEventFlush(t *testing.
 		t.Fatal(err)
 	}
 	text := string(data)
-	if !strings.Contains(text, "dolt:\n  disable-event-flush: false") {
+	if !strings.Contains(text, "dolt:") || !strings.Contains(text, "  disable-event-flush: false") {
 		t.Fatalf("config should move flat Dolt telemetry setting into object:\n%s", text)
 	}
 	if strings.Contains(text, "dolt.disable-event-flush") {
@@ -836,7 +890,8 @@ func TestEnsureCanonicalConfigFallsBackToLineRewriteOnMalformedYAML(t *testing.T
 	for _, needle := range []string{
 		"issue_prefix: gc",
 		"issue-prefix: gc",
-		"dolt.auto-start: false",
+		"dolt:",
+		"  auto-start: false",
 		"gc.endpoint_origin: managed_city",
 		"gc.endpoint_status: verified",
 		": not yaml",
@@ -844,6 +899,9 @@ func TestEnsureCanonicalConfigFallsBackToLineRewriteOnMalformedYAML(t *testing.T
 		if !strings.Contains(text, needle) {
 			t.Fatalf("config missing %q after malformed fallback:\n%s", needle, text)
 		}
+	}
+	if strings.Contains(text, "dolt.auto-start") {
+		t.Fatalf("config should scrub flat dolt.auto-start key:\n%s", text)
 	}
 	if strings.Contains(text, "dolt_server_port") {
 		t.Fatalf("config should scrub deprecated port key after malformed fallback:\n%s", text)
@@ -1992,5 +2050,74 @@ func TestEnsureCanonicalMetadataPreservesAllKeysOnEmptyBackend(t *testing.T) {
 		if _, ok := meta[key]; !ok {
 			t.Fatalf("metadata should preserve %q when backend is empty: %s", key, data)
 		}
+	}
+}
+
+// TestEnsureCanonicalConfigAutoStartVisibleToNestedOnlyReader is the
+// cross-process regression test for gc-bstlaj: gc previously wrote
+// dolt.auto-start as a flat dotted key, which round-tripped fine through
+// gc's own reader (ReadAutoStartDisabled) but was invisible to any bd
+// process using the nested-map-only fallback reader (GetStringFromDir),
+// silently re-enabling auto-start for those processes. Assert visibility
+// through getStringFromDirNestedOnly, not through gc's own reader.
+func TestEnsureCanonicalConfigAutoStartVisibleToNestedOnlyReader(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	if _, err := EnsureCanonicalConfig(fs, path, ConfigState{
+		IssuePrefix:    "gc",
+		EndpointOrigin: EndpointOriginManagedCity,
+		EndpointStatus: EndpointStatusVerified,
+	}); err != nil {
+		t.Fatalf("EnsureCanonicalConfig() error = %v", err)
+	}
+
+	value, ok := getStringFromDirNestedOnly(t, fs, path, "dolt", "auto-start")
+	if !ok {
+		t.Fatalf("dolt.auto-start not visible to a nested-map-only reader (bd's GetStringFromDir); a flat dotted key regressed gc-bstlaj")
+	}
+	if value != "false" {
+		t.Fatalf("dolt.auto-start = %q via nested-only reader, want %q", value, "false")
+	}
+}
+
+// TestEnsureCanonicalConfigFallbackAutoStartVisibleToNestedOnlyReader is the
+// same cross-process check for the malformed-YAML text-rewrite fallback path
+// (ensureCanonicalConfigFallback / ensureFallbackNestedDoltKey).
+func TestEnsureCanonicalConfigFallbackAutoStartVisibleToNestedOnlyReader(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	input := strings.Join([]string{
+		"issue_prefix: gc",
+		"issue-prefix: gc",
+		"dolt.auto-start: true",
+		"export.auto: false",
+		"gc.endpoint_origin: managed_city",
+		"gc.endpoint_status: verified",
+		"",
+		`sync.remote: "git+ssh://git@example.com/foo/service-inventory.git"  types.custom: molecule,convoy`,
+		"types.custom: molecule,convoy",
+		"",
+	}, "\n")
+	if err := fs.WriteFile(path, []byte(input), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := EnsureCanonicalConfig(fs, path, ConfigState{
+		IssuePrefix:    "gc",
+		EndpointOrigin: EndpointOriginManagedCity,
+		EndpointStatus: EndpointStatusVerified,
+	}); err != nil {
+		t.Fatalf("EnsureCanonicalConfig() error = %v", err)
+	}
+
+	value, ok := getStringFromDirNestedOnly(t, fs, path, "dolt", "auto-start")
+	if !ok {
+		t.Fatalf("dolt.auto-start not visible to a nested-map-only reader after malformed-YAML fallback rewrite; a flat dotted key regressed gc-bstlaj")
+	}
+	if value != "false" {
+		t.Fatalf("dolt.auto-start = %q via nested-only reader, want %q", value, "false")
 	}
 }

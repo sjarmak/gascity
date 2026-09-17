@@ -183,6 +183,11 @@ func ReadIssuePrefix(fs fsys.FS, path string) (string, bool, error) {
 }
 
 // ReadAutoStartDisabled reports whether dolt.auto-start is disabled in config.
+//
+// Checks the canonical nested form (dolt: / auto-start:) first, then falls
+// back to the legacy flat dotted key ("dolt.auto-start") so a rig gc wrote
+// before gc-bstlaj still reads correctly until its config.yaml is next
+// canonicalized.
 func ReadAutoStartDisabled(fs fsys.FS, path string) (bool, error) {
 	doc, err := readConfigDoc(fs, path)
 	if err != nil {
@@ -194,7 +199,11 @@ func ReadAutoStartDisabled(fs fsys.FS, path string) (bool, error) {
 		}
 		return false, err
 	}
-	if value, ok := configStringValue(mappingRoot(doc), "dolt.auto-start"); ok {
+	root := mappingRoot(doc)
+	if autoStart, ok := nestedConfigBoolValue(root, "dolt", "auto-start"); ok {
+		return !autoStart, nil
+	}
+	if value, ok := configStringValue(root, "dolt.auto-start"); ok {
 		return value == "false", nil
 	}
 	return false, nil
@@ -429,7 +438,13 @@ func EnsureCanonicalConfig(fs fsys.FS, path string, state ConfigState) (bool, er
 		changed = setString(root, "issue_prefix", prefix) || changed
 		changed = setString(root, "issue-prefix", prefix) || changed
 	}
-	changed = setBool(root, "dolt.auto-start", false) || changed
+	// Nested form (dolt: / auto-start: false), not the flat dotted key: bd's
+	// GetStringFromDir fallback reader (used by cmd/bd/bootstrap.go and others
+	// before bd's own config.Initialize() has run) walks nested maps only and
+	// returns "" for a flat "dolt.auto-start" key, silently defaulting
+	// AutoStart to true for any bd process gc did not launch (gc-bstlaj).
+	changed = setNestedBool(root, "dolt", "auto-start", false) || changed
+	changed = deleteKeys(root, "dolt.auto-start") || changed
 	doltConfig := readDoltConfigFromRoot(root)
 	if state.Dolt.DisableEventFlush != nil {
 		doltConfig.DisableEventFlush = state.Dolt.DisableEventFlush
@@ -586,9 +601,8 @@ func ensureCanonicalConfigFallback(fs fsys.FS, path string, state ConfigState) (
 	}
 
 	replacements := map[string]string{
-		"dolt.auto-start": "dolt.auto-start: false",
-		"export.auto":     "export.auto: false",
-		"backup.enabled":  "backup.enabled: false",
+		"export.auto":    "export.auto: false",
+		"backup.enabled": "backup.enabled: false",
 	}
 	if prefix != "" {
 		replacements["issue_prefix"] = "issue_prefix: " + prefix
@@ -608,6 +622,7 @@ func ensureCanonicalConfigFallback(fs fsys.FS, path string, state ConfigState) (
 		"dolt.password":            {},
 		"dolt.disable-event-flush": {},
 		"dolt.disable_event_flush": {},
+		"dolt.auto-start":          {},
 		"dolt_port":                {},
 		"dolt_server_port":         {},
 	}
@@ -685,7 +700,6 @@ func ensureCanonicalConfigFallback(fs fsys.FS, path string, state ConfigState) (
 	orderedKeys := []string{
 		"issue_prefix",
 		"issue-prefix",
-		"dolt.auto-start",
 		"export.auto",
 		"backup.enabled",
 		"gc.endpoint_origin",
@@ -705,8 +719,11 @@ func ensureCanonicalConfigFallback(fs fsys.FS, path string, state ConfigState) (
 		changed = true
 	}
 	var doltChanged bool
-	out, doltChanged = ensureFallbackNestedDoltDisableEventFlush(out, disableEventFlush)
+	out, doltChanged = ensureFallbackNestedDoltKey(out, "disable-event-flush", []string{"disable_event_flush"}, boolString(disableEventFlush))
 	changed = doltChanged || changed
+	var autoStartChanged bool
+	out, autoStartChanged = ensureFallbackNestedDoltKey(out, "auto-start", nil, boolString(false))
+	changed = autoStartChanged || changed
 
 	if !changed {
 		return false, nil
@@ -1018,8 +1035,24 @@ func topLevelConfigLine(line string) (key, value string, ok bool) {
 	return strings.TrimSpace(key), strings.TrimSpace(value), true
 }
 
-func ensureFallbackNestedDoltDisableEventFlush(lines []string, value bool) ([]string, bool) {
-	want := "  disable-event-flush: " + boolString(value)
+// ensureFallbackNestedDoltKey ensures a `dolt:` nested key is present with the
+// given value string in the malformed-YAML fallback path, matching aliases
+// (deprecated spellings) as the same logical key. Generalized so any nested
+// dolt.* key (disable-event-flush, auto-start) can share this line-based
+// rewriter without duplicating the section-scan logic.
+func ensureFallbackNestedDoltKey(lines []string, key string, aliases []string, valueStr string) ([]string, bool) {
+	want := "  " + key + ": " + valueStr
+	matches := func(k string) bool {
+		if k == key {
+			return true
+		}
+		for _, alias := range aliases {
+			if k == alias {
+				return true
+			}
+		}
+		return false
+	}
 	sectionIndex := -1
 	for i, line := range lines {
 		key, _, ok := topLevelConfigLine(line)
@@ -1051,8 +1084,8 @@ func ensureFallbackNestedDoltDisableEventFlush(lines []string, value bool) ([]st
 
 	seen := false
 	for _, line := range lines[sectionIndex+1 : sectionEnd] {
-		key, ok := nestedConfigLineKey(line)
-		if ok && (key == "disable-event-flush" || key == "disable_event_flush") {
+		lineKey, ok := nestedConfigLineKey(line)
+		if ok && matches(lineKey) {
 			if seen {
 				changed = true
 				continue
