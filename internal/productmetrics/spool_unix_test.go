@@ -11020,9 +11020,12 @@ func BenchmarkRecordOnceEnqueue(b *testing.B) {
 
 func newMetricsBenchmarkHome(b *testing.B) gchome.ProductUsageHome {
 	b.Helper()
-	trustedTempRoot := "/tmp"
+	// See inspectStorageTestHome in storage_unix_test.go: /var/tmp keeps this
+	// root-owned sticky trust-boundary fixture off the shared, reaper-swept
+	// /tmp tmpfs.
+	trustedTempRoot := "/var/tmp"
 	if runtime.GOOS == "darwin" {
-		trustedTempRoot = "/private/tmp"
+		trustedTempRoot = "/private/var/tmp"
 	}
 	b.Setenv("GOTMPDIR", trustedTempRoot)
 	b.Setenv("TMPDIR", trustedTempRoot)

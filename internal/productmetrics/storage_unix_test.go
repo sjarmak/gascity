@@ -28,10 +28,16 @@ func inspectStorageTestHome(t *testing.T, createRoot bool) gchome.ProductUsageHo
 	t.Helper()
 	// The shared workspace lives below a deliberately group-writable /data.
 	// Put this trust-boundary fixture below the supported root-owned sticky
-	// ancestor instead.
-	trustedTempRoot := "/tmp"
+	// ancestor instead. Use /var/tmp, not /tmp: /tmp is a size-capped
+	// tmpfs shared fleet-wide and swept by a same-UID reaper on age, and a
+	// reap mid-test (e.g. between a rename and the following chmod) surfaces
+	// as a spurious ENOENT in these destructive-filesystem tests. /var/tmp is
+	// disk-backed and outside that reaper's scan root, while remaining a
+	// root-owned sticky (mode 1777) ancestor equivalent to /tmp for this
+	// trust-boundary check.
+	trustedTempRoot := "/var/tmp"
 	if runtime.GOOS == "darwin" {
-		trustedTempRoot = "/private/tmp"
+		trustedTempRoot = "/private/var/tmp"
 	}
 	// Go 1.26's testing.T.TempDir prefers GOTMPDIR over TMPDIR. Set both so
 	// repository test runners may keep their build scratch space below /data
@@ -1002,9 +1008,11 @@ func TestStorageReadOnlyExistingDescendantOpenDoesNotRepair(t *testing.T) {
 }
 
 func TestStorageRootCreationRetryRecoversMissingIntermediateParentSync(t *testing.T) {
-	trustedTempRoot := "/tmp"
+	// See inspectStorageTestHome above: /var/tmp keeps this root-owned sticky
+	// trust-boundary fixture off the shared, reaper-swept /tmp tmpfs.
+	trustedTempRoot := "/var/tmp"
 	if runtime.GOOS == "darwin" {
-		trustedTempRoot = "/private/tmp"
+		trustedTempRoot = "/private/var/tmp"
 	}
 	t.Setenv("GOTMPDIR", trustedTempRoot)
 	t.Setenv("TMPDIR", trustedTempRoot)

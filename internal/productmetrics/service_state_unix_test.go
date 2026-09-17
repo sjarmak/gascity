@@ -186,9 +186,12 @@ func TestStatusIsByteForByteReadOnlyAcrossAbsentCorruptAndUnsafeStates(t *testin
 }
 
 func TestOpenProductionAndPreparationAreLazyAndNonCreating(t *testing.T) {
-	trustedTempRoot := "/tmp"
+	// See inspectStorageTestHome in storage_unix_test.go: /var/tmp keeps this
+	// root-owned sticky trust-boundary fixture off the shared, reaper-swept
+	// /tmp tmpfs.
+	trustedTempRoot := "/var/tmp"
 	if runtime.GOOS == "darwin" {
-		trustedTempRoot = "/private/tmp"
+		trustedTempRoot = "/private/var/tmp"
 	}
 	t.Setenv("GOTMPDIR", trustedTempRoot)
 	t.Setenv("TMPDIR", trustedTempRoot)
