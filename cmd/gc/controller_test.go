@@ -1245,12 +1245,19 @@ func TestControllerReloadsNamedSessionModeAndAppliesIdleTimeout(t *testing.T) {
 	if got := parsedCfg.Agents[0].IdleTimeoutDuration(); got != 5*time.Second {
 		t.Fatalf("parsed idle_timeout duration = %v, want %v", got, 5*time.Second)
 	}
-	tracker, ok := buildIdleTracker(parsedCfg, "test", dir, sp).(*memoryIdleTracker)
+	// Keep the tracker probe independent from the controller provider: once the
+	// reload is observed, the controller may stop that session immediately.
+	probeSP := runtime.NewFake()
+	startFakeSession(t, probeSP, "mayor")
+	probeNow := time.Now()
+	probeActivity := probeNow.Add(-10 * time.Minute)
+	probeSP.SetActivity("mayor", probeActivity)
+	tracker, ok := buildIdleTracker(parsedCfg, "test", dir, probeSP).(*memoryIdleTracker)
 	if !ok || tracker == nil {
 		t.Fatal("buildIdleTracker(parsedCfg) = nil, want tracker")
 	}
-	if !tracker.checkIdle("mayor", "", "", "", sp, time.Now()) {
-		t.Fatalf("fresh idle tracker did not consider mayor idle; activity=%v timeouts=%v", sp.Activity["mayor"], tracker.timeouts)
+	if !tracker.checkIdle("mayor", "", "", "", probeSP, probeNow) {
+		t.Fatalf("fresh idle tracker did not consider mayor idle; activity=%v timeouts=%v", probeActivity, tracker.timeouts)
 	}
 
 	bead := waitForNamedMode("on_demand", hangBudget)
