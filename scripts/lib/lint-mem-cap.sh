@@ -52,6 +52,15 @@ gc_lint_mem_cap_available() {
     echo no-manager
     return 1
   fi
+  # "infinity" is a value systemd genuinely accepts for MemoryMax=/
+  # MemorySwapMax= (it means unlimited), so the probe below would report
+  # "ok" -- but an unlimited ceiling never binds, which defeats the whole
+  # point of this fence. Reject it explicitly rather than letting a
+  # syntactically-valid-but-useless value pass as a working cap.
+  if [[ "${GC_LINT_MEMORY_MAX,,}" == "infinity" || "${GC_LINT_MEMORY_SWAP_MAX,,}" == "infinity" ]]; then
+    echo bad-value
+    return 1
+  fi
   if ! command -v systemd-run >/dev/null 2>&1; then
     echo no-manager
     return 1
@@ -63,8 +72,12 @@ gc_lint_mem_cap_available() {
     echo no-manager
     return 1
   fi
+  # Probe both ceilings so a bad GC_LINT_MEMORY_SWAP_MAX fails through this
+  # same diagnostic instead of surfacing later as a raw systemd error from
+  # the real (capped) invocation.
   if ! systemd-run --user --scope --collect --quiet \
-    -p MemoryMax="$GC_LINT_MEMORY_MAX" -- true >/dev/null 2>&1; then
+    -p MemoryMax="$GC_LINT_MEMORY_MAX" \
+    -p MemorySwapMax="$GC_LINT_MEMORY_SWAP_MAX" -- true >/dev/null 2>&1; then
     echo bad-value
     return 1
   fi
@@ -74,7 +87,12 @@ gc_lint_mem_cap_available() {
 
 gc_lint_mem_cap_exec() {
   local status
-  status="$(gc_lint_mem_cap_available)"
+  # gc_lint_mem_cap_available returns non-zero for every non-"ok" outcome,
+  # and this file is sourced into callers running under `set -euo
+  # pipefail` (lint-run.sh) -- without `|| true` here, errexit kills this
+  # function on this line before the case block below ever runs, so
+  # GC_LINT_NO_MEM_CAP=1 and every bad-value diagnostic are unreachable.
+  status="$(gc_lint_mem_cap_available)" || true
   case "$status" in
     ok)
       exec systemd-run --user --scope --collect --quiet \
@@ -82,7 +100,7 @@ gc_lint_mem_cap_exec() {
         -p MemorySwapMax="$GC_LINT_MEMORY_SWAP_MAX" -- "$@"
       ;;
     bad-value)
-      echo "gc_lint_mem_cap: GC_LINT_MEMORY_MAX=$GC_LINT_MEMORY_MAX was rejected by systemd; refusing to run golangci-lint without a working memory cap. systemd's MemoryMax= wants a byte count or a K/M/G/T suffix with no 'i' and no trailing 'B' (e.g. 7G, not 7GiB or 7GB)." >&2
+      echo "gc_lint_mem_cap: GC_LINT_MEMORY_MAX=$GC_LINT_MEMORY_MAX / GC_LINT_MEMORY_SWAP_MAX=$GC_LINT_MEMORY_SWAP_MAX was rejected; refusing to run golangci-lint without a working memory cap. systemd's MemoryMax=/MemorySwapMax= want a byte count, a K/M/G/T suffix with no 'i' and no trailing 'B' (e.g. 7G, not 7GiB or 7GB), or are rejected outright if set to 'infinity' (unlimited never binds)." >&2
       return 1
       ;;
     no-manager)
@@ -90,6 +108,15 @@ gc_lint_mem_cap_exec() {
         echo "gc_lint_mem_cap: WARNING - no responsive user systemd manager; running '$*' WITHOUT a memory cap. An overshoot here can OOM the whole host, not just this process." >&2
       fi
       exec "$@"
+      ;;
+    *)
+      # Must never fall through silently: a status this function does not
+      # recognize would otherwise return 0 from gc_lint_mem_cap_exec without
+      # running the wrapped command at all, so `make lint` would exit 0
+      # having linted nothing -- the worst possible failure mode for a
+      # safety fence. Fail loud instead.
+      echo "gc_lint_mem_cap: internal error - gc_lint_mem_cap_available returned unrecognized status '$status'; refusing to run golangci-lint uncapped or silently." >&2
+      return 1
       ;;
   esac
 }

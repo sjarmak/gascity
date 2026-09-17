@@ -56,14 +56,22 @@ write_fake_systemd_run() {
 set -euo pipefail
 printf '%s\n' "\$*" >>"$log"
 mem=""
+swap=""
 args=("\$@")
 for ((i=0; i<\${#args[@]}; i++)); do
   if [[ "\${args[i]}" == -p && "\${args[i+1]}" == MemoryMax=* ]]; then
     mem="\${args[i+1]#MemoryMax=}"
   fi
+  if [[ "\${args[i]}" == -p && "\${args[i+1]}" == MemorySwapMax=* ]]; then
+    swap="\${args[i+1]#MemorySwapMax=}"
+  fi
 done
 if [[ -n "\$mem" && ! "\$mem" =~ ^[0-9]+[KMGT]?\$ ]]; then
   echo "fake systemd-run: invalid MemoryMax value: \$mem" >&2
+  exit 1
+fi
+if [[ -n "\$swap" && ! "\$swap" =~ ^[0-9]+[KMGT]?\$ ]]; then
+  echo "fake systemd-run: invalid MemorySwapMax value: \$swap" >&2
   exit 1
 fi
 while [[ \$# -gt 0 && "\$1" != "--" ]]; do shift; done
@@ -147,6 +155,27 @@ minimal_toolbox() {
   done
 }
 
+# All scenarios below drive gc_lint_mem_cap_exec the same way production
+# does: `bash -c "set -euo pipefail; source ...; gc_lint_mem_cap_exec ..."`.
+# lint-run.sh runs under `set -euo pipefail` itself, and
+# gc_lint_mem_cap_available returns non-zero for every non-"ok" outcome --
+# a plain `bash -c "source ...; ..."` with errexit OFF (as this file used
+# to invoke it) cannot see a bug that only bites under errexit, and it
+# missed exactly that bug once already (round 3, gc-vrva1q).
+# run_capped is invoked as: env -i PATH=... VAR=... run_capped 'quoted-arg'
+# `env -i` clears the environment for isolation, which also strips any
+# shell function definitions -- so this must be a real command, not a
+# function. It re-execs bash itself with the errexit/nounset/pipefail
+# options production actually runs under.
+cat >"$work/run_capped" <<RUNCAPPED
+#!/usr/bin/env bash
+set -euo pipefail
+source '$mem_cap_lib'
+eval "gc_lint_mem_cap_exec \$*"
+RUNCAPPED
+chmod +x "$work/run_capped"
+run_capped="$work/run_capped"
+
 # ── C1: an accepted cap value really kills an overshoot ─────────────────
 scenario="$work/enforcing"
 mkdir -p "$scenario"
@@ -157,17 +186,27 @@ write_fake_systemd_run_enforcing "$scenario/bin/systemd-run" "$sdr_log" 5
 write_growing_hog "$scenario/hog"
 
 set +e
-out="$(env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX=300M \
-  bash -c "source '$mem_cap_lib'; gc_lint_mem_cap_exec '$scenario/hog'" 2>&1)"
+out="$(env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX=300M GC_LINT_MEMORY_SWAP_MAX=100M \
+  "$run_capped" "'$scenario/hog'" 2>&1)"
 status=$?
 set -e
 if [[ "$status" -ne 137 ]]; then
   fail "C1: expected exit 137 from an enforced overshoot, got $status: $out"
 fi
-# gc_lint_mem_cap_available makes two probe calls (manager-reachable,
-# then value-accepted) before the real capped exec: three total.
+# gc_lint_mem_cap_available makes two probe calls (manager-reachable, then
+# value-accepted) before the real capped exec: three total.
 if [[ "$(wc -l <"$sdr_log" | tr -d '[:space:]')" -ne 3 ]]; then
   fail "C1: expected exactly three systemd-run invocations (2 probes + 1 real), got $(cat "$sdr_log")"
+fi
+# The real (third) invocation must actually carry both ceilings -- catches
+# a regression that strips -p MemoryMax= or -p MemorySwapMax= from the
+# real exec while leaving the probes intact.
+real_invocation="$(tail -n1 "$sdr_log")"
+if [[ "$real_invocation" != *"-p MemoryMax=300M"* ]]; then
+  fail "C1: real systemd-run invocation missing -p MemoryMax=300M: $real_invocation"
+fi
+if [[ "$real_invocation" != *"-p MemorySwapMax=100M"* ]]; then
+  fail "C1: real systemd-run invocation missing -p MemorySwapMax=100M: $real_invocation"
 fi
 
 # ── C2: a value systemd rejects is a hard failure, command never runs ───
@@ -184,10 +223,10 @@ touch "$marker"
 FAKE
 chmod +x "$scenario/hog"
 
-for bad in 12GiB 12GB 12Gi 12g bogus; do
+for bad in 12GiB 12GB 12Gi 12g bogus infinity Infinity; do
   set +e
   out="$(env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX="$bad" \
-    bash -c "source '$mem_cap_lib'; gc_lint_mem_cap_exec '$scenario/hog'" 2>&1)"
+    "$run_capped" "'$scenario/hog'" 2>&1)"
   status=$?
   set -e
   if [[ "$status" -eq 0 ]]; then
@@ -197,16 +236,34 @@ for bad in 12GiB 12GB 12Gi 12g bogus; do
     fail "C2: GC_LINT_MEMORY_MAX=$bad let the wrapped command run"
     rm -f "$marker"
   fi
-  if ! grep -qi "rejected by systemd" <<<"$out"; then
+  if ! grep -qi "rejected" <<<"$out"; then
     fail "C2: GC_LINT_MEMORY_MAX=$bad did not report a rejection: $out"
   fi
 done
+
+# a bad swap ceiling must be caught by the same probe, not surface later
+# as a raw systemd error from the real invocation.
+set +e
+out="$(env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX=7G GC_LINT_MEMORY_SWAP_MAX=bogus \
+  "$run_capped" "'$scenario/hog'" 2>&1)"
+status=$?
+set -e
+if [[ "$status" -eq 0 ]]; then
+  fail "C2: GC_LINT_MEMORY_SWAP_MAX=bogus was accepted (silently uncapped); want a hard failure"
+fi
+if [[ -e "$marker" ]]; then
+  fail "C2: GC_LINT_MEMORY_SWAP_MAX=bogus let the wrapped command run"
+  rm -f "$marker"
+fi
+if ! grep -qi "rejected" <<<"$out"; then
+  fail "C2: GC_LINT_MEMORY_SWAP_MAX=bogus did not report a rejection: $out"
+fi
 
 # accepted spellings must still work through the same probe.
 for good in 7G 300M 1T; do
   set +e
   out="$(env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX="$good" \
-    bash -c "source '$mem_cap_lib'; gc_lint_mem_cap_exec '$scenario/hog'" 2>&1)"
+    "$run_capped" "'$scenario/hog'" 2>&1)"
   status=$?
   set -e
   if [[ "$status" -ne 0 ]]; then
@@ -233,7 +290,7 @@ chmod +x "$scenario/hog"
 
 set +e
 out="$(env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX=300M \
-  bash -c "source '$mem_cap_lib'; gc_lint_mem_cap_exec '$scenario/hog'" 2>&1)"
+  "$run_capped" "'$scenario/hog'" 2>&1)"
 status=$?
 set -e
 if [[ "$status" -ne 0 ]]; then
@@ -246,10 +303,35 @@ if ! grep -qF "hog ran" <<<"$out"; then
   fail "C3: no-manager fallback did not run the wrapped command: $out"
 fi
 
+# the documented escape hatch (GC_LINT_NO_MEM_CAP=1) must reach exec even
+# when a systemd manager IS reachable -- this is the round-3 errexit bug's
+# other victim: `status="$(gc_lint_mem_cap_available)"` without `|| true`
+# killed the function before the no-manager case ever ran.
+scenario2="$work/no-manager-optout-with-manager"
+mkdir -p "$scenario2"
+minimal_toolbox "$scenario2/bin"
+write_fake_systemd_run "$scenario2/bin/systemd-run" "$scenario2/systemd-run.log"
+cat >"$scenario2/hog" <<'FAKE'
+#!/usr/bin/env bash
+echo "hog ran"
+FAKE
+chmod +x "$scenario2/hog"
+set +e
+out="$(env -i PATH="$scenario2/bin" GC_LINT_MEMORY_MAX=7G GC_LINT_NO_MEM_CAP=1 \
+  "$run_capped" "'$scenario2/hog'" 2>&1)"
+status=$?
+set -e
+if [[ "$status" -ne 0 ]]; then
+  fail "C3b: GC_LINT_NO_MEM_CAP=1 with a reachable manager did not run cleanly, got $status: $out"
+fi
+if ! grep -qF "hog ran" <<<"$out"; then
+  fail "C3b: GC_LINT_NO_MEM_CAP=1 with a reachable manager did not run the wrapped command: $out"
+fi
+
 # ── C4: explicit opt-out stays silent ────────────────────────────────────
 set +e
 out="$(env -i PATH="$scenario/bin" GC_LINT_MEMORY_MAX=300M GC_LINT_NO_MEM_CAP=1 \
-  bash -c "source '$mem_cap_lib'; gc_lint_mem_cap_exec '$scenario/hog'" 2>&1)"
+  "$run_capped" "'$scenario/hog'" 2>&1)"
 status=$?
 set -e
 if [[ "$status" -ne 0 ]]; then
@@ -257,6 +339,41 @@ if [[ "$status" -ne 0 ]]; then
 fi
 if grep -qi "WARNING" <<<"$out"; then
   fail "C4: opt-out fallback warned; want silent: $out"
+fi
+
+# ── C4b: an unrecognized probe status fails loud instead of no-op-passing ─
+set +e
+out="$(bash -c "
+  set -euo pipefail
+  source '$mem_cap_lib'
+  gc_lint_mem_cap_available() { echo something-unexpected; return 1; }
+  gc_lint_mem_cap_exec /bin/true
+" 2>&1)"
+status=$?
+set -e
+if [[ "$status" -eq 0 ]]; then
+  fail "C4b: an unrecognized cap status returned success without running anything; want a hard failure"
+fi
+if ! grep -qi "unrecognized status" <<<"$out"; then
+  fail "C4b: an unrecognized cap status did not report the internal-error diagnostic: $out"
+fi
+
+# ── C4c: shipped defaults are the measured-safe values, not decoration ──
+# Round 1's defect was a ceiling set ABOVE every measured peak (12G /
+# 10GiB against an 8.08-9.85 GiB measured range), so it never engaged.
+# Pin the actual shipped numbers so a future edit can't silently widen
+# them back past the peak without this test noticing.
+defaults_out="$(bash -c "
+  set -euo pipefail
+  source '$mem_cap_lib'
+  printf '%s %s\n' \"\$GC_LINT_MEMORY_MAX\" \"\$GC_LINT_MEMORY_SWAP_MAX\"
+")"
+if [[ "$defaults_out" != "7G 2G" ]]; then
+  fail "C4c: default GC_LINT_MEMORY_MAX/GC_LINT_MEMORY_SWAP_MAX = '$defaults_out', want '7G 2G'"
+fi
+gomemlimit_default="$(grep -oE 'GC_LINT_GOMEMLIMIT:=[^}]+' "$lint_run" | cut -d= -f2)"
+if [[ "$gomemlimit_default" != "3GiB" ]]; then
+  fail "C4c: default GC_LINT_GOMEMLIMIT = '$gomemlimit_default', want '3GiB'"
 fi
 
 # ── C5: lint-run.sh argv construction ────────────────────────────────────
