@@ -7033,6 +7033,69 @@ func TestBuildDesiredState_RigPoolIgnoresAssignedWorkInUnreachableStore(t *testi
 	}
 }
 
+// A cold custom-scale_check rig pool cannot see its own store's demand while
+// asleep, so the cold-wake probe (FR-S0.1) scans every active store,
+// including this pool's own rig store, and stamps the store reference it
+// finds onto the session it spawns (gc.trigger_bead_store_ref, later
+// re-published as gc.root_store_ref by worktree provisioning — gc-rqz4bb).
+// The probe's activeStores list must key the rig leg with the canonical
+// "rig:<name>" form, not the bare rig name, or that stamp is malformed and
+// gc-worktree-finalize's metadata-guarded-clear hard-fails on it.
+func TestBuildDesiredState_ColdCustomScaleCheckRigProbeStampsCanonicalStoreRef(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "riga")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatalf("create rig dir: %v", err)
+	}
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+	work, err := rigStore.Create(beads.Bead{
+		Title:  "rig-store routed work for cold pool",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": "riga/worker",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed bead: %v", err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "riga", Path: rigPath}},
+		Agents: []config.Agent{{
+			Name:              "worker",
+			Dir:               "riga",
+			StartCommand:      "true",
+			MaxActiveSessions: intPtr(5),
+			MinActiveSessions: intPtr(0),
+			// A non-empty, cold (returns 0) custom scale_check keeps this
+			// template off the ownScaleCheckTarget path (which already
+			// emits the canonical "rig:"+name form) and forces it through
+			// the generic cross-store cold-wake probe instead, the one
+			// built from the buggy activeStores construction.
+			ScaleCheck: "printf 0",
+		}},
+	}
+
+	got := buildDesiredStateWithSessionBeads(
+		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(),
+		cityStore, map[string]beads.Store{"riga": rigStore}, newSessionBeadSnapshot(nil), nil, io.Discard,
+	)
+
+	const template = "riga/worker"
+	if got.ScaleCheckCounts[template] != 1 {
+		t.Fatalf("ScaleCheckCounts[%s] = %d, want 1: cold-wake probe should see rig-store routed demand", template, got.ScaleCheckCounts[template])
+	}
+	session := poolSessionBeadForTemplate(t, cityStore, template)
+	if trigger := session.Metadata[beadmeta.TriggerBeadIDMetadataKey]; trigger != work.ID {
+		t.Fatalf("gc.trigger_bead_id = %q, want %q", trigger, work.ID)
+	}
+	if ref := session.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey]; ref != "rig:riga" {
+		t.Fatalf("gc.trigger_bead_store_ref = %q, want %q: cold-wake activeStores probe must emit the canonical rig: form, not a bare rig name", ref, "rig:riga")
+	}
+}
+
 func TestBuildDesiredState_AlwaysNamedSession_MaterializesWithoutWorkBeads(t *testing.T) {
 	cityPath := t.TempDir()
 	store := beads.NewMemStore()
