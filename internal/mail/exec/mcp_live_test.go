@@ -1,3 +1,5 @@
+//go:build integration
+
 package exec //nolint:revive // internal package, always imported with alias
 
 import (
