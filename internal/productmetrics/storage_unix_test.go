@@ -24,15 +24,27 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// destructiveFSTestTempRoot returns a root-owned, sticky-bit temp directory
+// for trust-boundary fixtures that must live outside a group-writable /data.
+// It deliberately avoids /tmp: on this fleet /tmp is a size-capped,
+// tmpfs-backed directory that shared systemd-tmpfiles cleanup and concurrent
+// same-UID processes sweep aggressively, which raced these tests' rename and
+// permission fixtures under host contention (gc-aimkr). /var/tmp carries the
+// same root:root sticky 1777 mode but is disk-backed and reaped far less
+// aggressively.
+func destructiveFSTestTempRoot() string {
+	if runtime.GOOS == "darwin" {
+		return "/private/var/tmp"
+	}
+	return "/var/tmp"
+}
+
 func inspectStorageTestHome(t *testing.T, createRoot bool) gchome.ProductUsageHome {
 	t.Helper()
 	// The shared workspace lives below a deliberately group-writable /data.
 	// Put this trust-boundary fixture below the supported root-owned sticky
 	// ancestor instead.
-	trustedTempRoot := "/tmp"
-	if runtime.GOOS == "darwin" {
-		trustedTempRoot = "/private/tmp"
-	}
+	trustedTempRoot := destructiveFSTestTempRoot()
 	// Go 1.26's testing.T.TempDir prefers GOTMPDIR over TMPDIR. Set both so
 	// repository test runners may keep their build scratch space below /data
 	// without moving this trust-boundary fixture below that unsafe ancestor.
@@ -1002,10 +1014,7 @@ func TestStorageReadOnlyExistingDescendantOpenDoesNotRepair(t *testing.T) {
 }
 
 func TestStorageRootCreationRetryRecoversMissingIntermediateParentSync(t *testing.T) {
-	trustedTempRoot := "/tmp"
-	if runtime.GOOS == "darwin" {
-		trustedTempRoot = "/private/tmp"
-	}
+	trustedTempRoot := destructiveFSTestTempRoot()
 	t.Setenv("GOTMPDIR", trustedTempRoot)
 	t.Setenv("TMPDIR", trustedTempRoot)
 	privateAncestor := t.TempDir()
