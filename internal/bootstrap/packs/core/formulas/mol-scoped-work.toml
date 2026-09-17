@@ -97,6 +97,18 @@ if [ -z "$WORK_BEAD_ID" ]; then
   exit 1
 fi
 WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
+if [ -n "$WORKTREE" ]; then
+  # A retained worktree is only safe to adopt if it still exists on disk,
+  # is a worktree git actually knows about, and its current base is still
+  # an ancestor of origin/{{base_branch}} (i.e. it isn't parked on a stale
+  # base from an earlier attempt). Otherwise drop the stale metadata and
+  # cut a fresh worktree below.
+  if [ ! -d "$WORKTREE" ] \
+    || ! git worktree list --porcelain | grep -qF "worktree $WORKTREE" \
+    || ! git -C "$WORKTREE" merge-base --is-ancestor HEAD origin/{{base_branch}}; then
+    WORKTREE=""
+  fi
+fi
 if [ -z "$WORKTREE" ]; then
   WORKTREE_PATH=$(pwd)/worktrees/"$WORK_BEAD_ID"
   git worktree add "$WORKTREE_PATH" --detach origin/{{base_branch}}
