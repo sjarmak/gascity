@@ -65,6 +65,7 @@ package testenv
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -226,13 +227,26 @@ var doltRuntimeStateRelPath = filepath.Join(".gc", "runtime", "packs", "dolt", "
 // city it is — walking all the way to the filesystem root is deliberately
 // more conservative, not less.
 func ambientCityDoltPort(dir string) (string, bool) {
+	root, ok := ambientCityRoot(dir)
+	if !ok {
+		return "", false
+	}
+	return doltStatePort(root)
+}
+
+// ambientCityRoot walks dir upward looking for a city.toml marker file and
+// returns the directory that contains it. ok is false when no city.toml is
+// discoverable above dir. Shared by ambientCityDoltPort (which only needs
+// the recorded port) and refuseProdDoltPort's self-owned-server check (which
+// also needs the recorded PID from the same city root).
+func ambientCityRoot(dir string) (string, bool) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return "", false
 	}
 	for {
 		if fi, statErr := os.Stat(filepath.Join(abs, cityConfigFileName)); statErr == nil && !fi.IsDir() {
-			return doltStatePort(abs)
+			return abs, true
 		}
 		parent := filepath.Dir(abs)
 		if parent == abs {
@@ -260,6 +274,83 @@ func doltStatePort(cityRoot string) (string, bool) {
 	return strconv.Itoa(state.Port), true
 }
 
+// doltStatePID reads cityRoot's managed-Dolt runtime state and returns its
+// recorded server PID. ok is false if the state file is missing, unparsable,
+// or names no positive PID.
+func doltStatePID(cityRoot string) (int, bool) {
+	data, err := os.ReadFile(filepath.Join(cityRoot, doltRuntimeStateRelPath))
+	if err != nil {
+		return 0, false
+	}
+	var state struct {
+		PID int `json:"pid"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil || state.PID <= 0 {
+		return 0, false
+	}
+	return state.PID, true
+}
+
+// isDescendantProcess reports whether pid names the current process or one
+// of its ancestors — i.e. whether the current process is pid itself or was
+// (transitively) spawned by it — walking the current process's own
+// parent-process chain via /proc on Linux. It fails closed: a missing /proc
+// entry, a parse error, a non-Linux platform, or a chain that bottoms out
+// without reaching pid all return false — "not proven to be mine" — so a
+// caller using this to disarm a safety guard only does so when ownership is
+// verified, never assumed. Bounded to a small number of hops so a corrupt or
+// cyclic /proc chain cannot spin.
+func isDescendantProcess(pid int) bool {
+	if pid <= 1 {
+		// PID 1 (init/container PID 1) sits at or near the root of nearly
+		// every process's ancestor chain, so finding it there proves
+		// nothing about self-ownership; treating it as an ancestor match
+		// would disarm the guard for nearly any recorded PID.
+		return false
+	}
+	cur := os.Getpid()
+	seen := make(map[int]bool, 64)
+	for i := 0; i < 64; i++ {
+		if cur == pid {
+			return true
+		}
+		if seen[cur] {
+			return false
+		}
+		seen[cur] = true
+		ppid, ok := procParentPID(cur)
+		if !ok || ppid <= 0 {
+			return false
+		}
+		cur = ppid
+	}
+	return false
+}
+
+// procParentPID reads pid's parent PID from /proc/<pid>/stat. The comm field
+// (2nd field) is parenthesized and may itself contain spaces or parens, so
+// this parses from the last ')' rather than splitting naively on spaces.
+func procParentPID(pid int) (int, bool) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, false
+	}
+	line := string(data)
+	end := strings.LastIndexByte(line, ')')
+	if end < 0 || end+2 >= len(line) {
+		return 0, false
+	}
+	fields := strings.Fields(line[end+2:])
+	if len(fields) < 2 {
+		return 0, false
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0, false
+	}
+	return ppid, true
+}
+
 // refuseProdDoltPort panics when a Dolt port var that will outlive init()
 // points at a production Dolt server. survives reports whether the named var
 // survives the scrub: always in testscript subcommand mode,
@@ -275,14 +366,32 @@ func doltStatePort(cityRoot string) (string, bool) {
 // hardcoded magic number. Known limitation: this guard runs only inside
 // internal/testenv's own init(), which never runs inside a forked,
 // separately-exec'd production `gc` binary subprocess — see ga-bixdpi.
+//
+// The ambient arm is skipped when this process is a descendant of the
+// ambient city's own recorded Dolt server PID (isDescendantProcess): a test
+// process that creates its own temp city and starts a managed Dolt server
+// for it, then re-invokes itself (e.g. as `gc`/`bd` via testscript.Main, or
+// a subprocess whose cwd lands inside that same temp city) legitimately
+// receives a port var naming that exact self-started, self-owned server.
+// That is not a leaked pointer at an unrelated (production) Dolt server —
+// walking the ambient city upward would otherwise always find it, because
+// the walk necessarily starts from inside the very city the process itself
+// just created (bead gc-c6o4j / TestInitFromWithoutHostedPreservesTemplate
+// false positive). The hardcoded ProdDoltPort arm above is never skipped by
+// this check, so a genuine production-port leak still refuses even from
+// inside a self-owned city.
 func refuseProdDoltPort(survives func(name string) bool) {
 	if os.Getenv(ProdDoltPortOptOutVar) == "1" {
 		return
 	}
 	refuseDoltPortValue(survives, ProdDoltPort)
 	if wd, err := os.Getwd(); err == nil {
-		if ambientPort, ok := ambientCityDoltPort(wd); ok {
-			refuseDoltPortValue(survives, ambientPort)
+		if cityRoot, ok := ambientCityRoot(wd); ok {
+			if ambientPort, ok := doltStatePort(cityRoot); ok {
+				if pid, ok := doltStatePID(cityRoot); !ok || !isDescendantProcess(pid) {
+					refuseDoltPortValue(survives, ambientPort)
+				}
+			}
 		}
 	}
 }

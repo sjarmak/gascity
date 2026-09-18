@@ -626,3 +626,80 @@ func exitStderr(err error) string {
 	}
 	return ""
 }
+
+// TestInitAmbientSelfOwnedCityDoltPortDoesNotPanic reproduces the false
+// positive filed as gastownhall/gascity#6427: a process that starts a
+// managed Dolt server for its own (e.g. temp) city, then points a
+// subprocess cwd at that same city while handing it that exact server port,
+// must not have refuseProdDoltPort mistake its own deliberately reachable
+// server for a leaked pointer at an unrelated Dolt server.
+//
+// This exercises three process generations because isDescendantProcess
+// needs a real, live parent/child relationship to walk via /proc: the top
+// test spawns a "launcher" that owns a synthetic city (dolt-state.json
+// records the launcher own PID as the server PID), and the launcher spawns
+// a "leaf" whose cwd is that city and whose env hands it the matching port,
+// exactly the shape of a test process handing a gc/bd subprocess a
+// connection to the managed server it just started for its own temp city.
+func TestInitAmbientSelfOwnedCityDoltPortDoesNotPanic(t *testing.T) {
+	const selfOwnedPort = "18888" // neither ProdDoltPort (3307) nor any other guarded synthetic value in this file
+
+	switch {
+	case os.Getenv("GC_TESTENV_LEAF") == "1":
+		os.Stdout.WriteString("BEADS_DOLT_SERVER_PORT=" + os.Getenv("BEADS_DOLT_SERVER_PORT") + "\n") //nolint:errcheck
+		os.Exit(0)
+	case os.Getenv("GC_TESTENV_LAUNCHER") == "1":
+		root := os.Getenv("GC_TESTENV_LAUNCHER_CITY_ROOT")
+		stateDir := filepath.Join(root, ".gc", "runtime", "packs", "dolt")
+		if err := os.MkdirAll(stateDir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "mkdir dolt state dir: %v\n", err) //nolint:errcheck
+			os.Exit(2)
+		}
+		state := fmt.Sprintf(`{"running":true,"pid":%d,"port":%s,"data_dir":"x"}`, os.Getpid(), selfOwnedPort)
+		if err := os.WriteFile(filepath.Join(stateDir, "dolt-state.json"), []byte(state), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "write dolt-state.json: %v\n", err) //nolint:errcheck
+			os.Exit(2)
+		}
+		exe, err := os.Executable()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Executable: %v\n", err) //nolint:errcheck
+			os.Exit(2)
+		}
+		leaf := exec.Command(exe, "-test.run=^TestInitAmbientSelfOwnedCityDoltPortDoesNotPanic$", "-test.v")
+		leaf.Dir = root
+		leaf.Env = []string{
+			"GC_TESTENV_LEAF=1",
+			"GC_TESTENV_PASSTHROUGH=BEADS_DOLT_SERVER_PORT",
+			"BEADS_DOLT_SERVER_PORT=" + selfOwnedPort,
+		}
+		out, err := leaf.CombinedOutput()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "LEAF_ERR=%v\nLEAF_OUT=%s\n", err, out) //nolint:errcheck
+			os.Exit(1)
+		}
+		os.Stdout.Write(out) //nolint:errcheck
+		os.Exit(0)
+	}
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "city.toml"), []byte("# synthetic self-owned city\n"), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("Executable: %v", err)
+	}
+	launcher := exec.Command(exe, "-test.run=^TestInitAmbientSelfOwnedCityDoltPortDoesNotPanic$", "-test.v")
+	launcher.Env = append(os.Environ(),
+		"GC_TESTENV_LAUNCHER=1",
+		"GC_TESTENV_LAUNCHER_CITY_ROOT="+root,
+	)
+	out, err := launcher.CombinedOutput()
+	if err != nil {
+		t.Fatalf("launcher (and its self-owned leaf) should not have refused its own managed Dolt port: %v\noutput:\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "BEADS_DOLT_SERVER_PORT="+selfOwnedPort) {
+		t.Errorf("leaf output missing expected surviving port; got:\n%s", out)
+	}
+}

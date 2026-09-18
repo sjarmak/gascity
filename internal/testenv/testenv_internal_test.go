@@ -1,8 +1,11 @@
 package testenv
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads/contract"
@@ -166,4 +169,45 @@ func TestAmbientCityDoltPort(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestIsDescendantProcess exercises isDescendantProcess against the current
+// process itself, invalid/unrelated PIDs, and a real live ancestor: a
+// spawned helper child checks that its own direct parent (this test
+// process) is correctly recognized as its ancestor.
+func TestIsDescendantProcess(t *testing.T) {
+	if !isDescendantProcess(os.Getpid()) {
+		t.Errorf("isDescendantProcess(self) = false, want true")
+	}
+	if isDescendantProcess(0) {
+		t.Errorf("isDescendantProcess(0) = true, want false")
+	}
+	if isDescendantProcess(-1) {
+		t.Errorf("isDescendantProcess(-1) = true, want false")
+	}
+	if isDescendantProcess(999999) {
+		t.Errorf("isDescendantProcess(999999) = true, want false; an unrelated/nonexistent PID must never be treated as an ancestor of this process")
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcessChecksParentIsAncestor$", "-test.v")
+	cmd.Env = append(os.Environ(), "GC_TESTENV_HELPER_CHECK_PARENT=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helper child: %v\noutput:\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "PARENT_IS_ANCESTOR=true") {
+		t.Errorf("helper child did not recognize this test process (its direct parent) as its ancestor; output:\n%s", out)
+	}
+}
+
+// TestHelperProcessChecksParentIsAncestor is not a real test; it is spawned
+// by TestIsDescendantProcess as a live child process so isDescendantProcess
+// has a real ancestor relationship to check. It no-ops unless the guard env
+// var is set, so a normal `go test` run never executes its body.
+func TestHelperProcessChecksParentIsAncestor(t *testing.T) {
+	t.Helper()
+	if os.Getenv("GC_TESTENV_HELPER_CHECK_PARENT") != "1" {
+		return
+	}
+	fmt.Printf("PARENT_IS_ANCESTOR=%v\n", isDescendantProcess(os.Getppid()))
 }
