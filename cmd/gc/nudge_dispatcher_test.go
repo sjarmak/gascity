@@ -515,6 +515,30 @@ func TestNudgeDispatcherIsSupervisor(t *testing.T) {
 	}
 }
 
+func TestNudgeDispatcherIsHosting(t *testing.T) {
+	if nudgeDispatcherIsHosting("") {
+		t.Error("empty cityPath must report not hosting")
+	}
+
+	dir := t.TempDir()
+	if nudgeDispatcherIsHosting(dir) {
+		t.Error("no listener on the wake socket must report not hosting")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wakeCh := make(chan struct{}, 1)
+	lis, err := startNudgeWakeListener(ctx, dir, wakeCh, nil, "test")
+	if err != nil {
+		t.Fatalf("startNudgeWakeListener: %v", err)
+	}
+	defer lis.Close() //nolint:errcheck
+
+	if !nudgeDispatcherIsHosting(dir) {
+		t.Error("live listener on the wake socket must report hosting")
+	}
+}
+
 func TestDispatchAllQueuedNudgesNilCfg(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
@@ -557,7 +581,7 @@ func TestMaybeStartNudgePollerSkipsACPSessionInLegacyMode(t *testing.T) {
 	}
 }
 
-func TestMaybeStartNudgePollerSkipsInSupervisorMode(t *testing.T) {
+func TestMaybeStartNudgePollerSkipsWhenDispatcherActuallyHosting(t *testing.T) {
 	prev := startNudgePoller
 	t.Cleanup(func() { startNudgePoller = prev })
 
@@ -567,13 +591,65 @@ func TestMaybeStartNudgePollerSkipsInSupervisorMode(t *testing.T) {
 		return nil
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dir := t.TempDir()
+	wakeCh := make(chan struct{}, 1)
+	lis, err := startNudgeWakeListener(ctx, dir, wakeCh, nil, "test")
+	if err != nil {
+		t.Fatalf("startNudgeWakeListener: %v", err)
+	}
+	defer lis.Close() //nolint:errcheck
+
+	maybeStartNudgePoller(nudgeTarget{
+		cityPath:    dir,
+		sessionName: "worker-session",
+		cfg:         supervisorCfg(),
+	})
+	if called {
+		t.Fatal("startNudgePoller invoked while a dispatcher is actually listening on the wake socket; the live dispatcher would race with the per-session poller")
+	}
+}
+
+// TestMaybeStartNudgePollerStartsWhenConfiguredButNotHosting is the
+// regression test for gc-3qty46: nudgeDispatcherIsSupervisor(target.cfg)
+// alone answered "is the city configured for a dispatcher", not "is one
+// actually delivering". A city configured for supervisor mode with no
+// process listening on the wake socket left every queued nudge with no
+// deliverer. Run against the parent commit (before switching
+// maybeStartNudgePoller to nudgeDispatcherIsHosting), this test fails:
+// startNudgePoller is never invoked because nudgeDispatcherIsSupervisor(cfg)
+// alone suppressed it.
+func TestMaybeStartNudgePollerStartsWhenConfiguredButNotHosting(t *testing.T) {
+	prev := startNudgePoller
+	t.Cleanup(func() { startNudgePoller = prev })
+
+	called := false
+	startNudgePoller = func(_, _, _ string) error {
+		called = true
+		return nil
+	}
+
+	// supervisorCfg but no listener started on the wake socket: configured
+	// for a dispatcher that is not actually hosting.
 	maybeStartNudgePoller(nudgeTarget{
 		cityPath:    t.TempDir(),
 		sessionName: "worker-session",
 		cfg:         supervisorCfg(),
 	})
-	if called {
-		t.Fatal("startNudgePoller invoked in supervisor mode; supervisor dispatcher would race with the per-session poller")
+	if !called {
+		t.Fatal("startNudgePoller not invoked despite no dispatcher listening on the wake socket; configuration alone must not suppress the fallback poller")
+	}
+}
+
+func TestMaybeStartNudgePollerStartsInLegacyMode(t *testing.T) {
+	prev := startNudgePoller
+	t.Cleanup(func() { startNudgePoller = prev })
+
+	called := false
+	startNudgePoller = func(_, _, _ string) error {
+		called = true
+		return nil
 	}
 
 	maybeStartNudgePoller(nudgeTarget{

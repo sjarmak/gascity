@@ -30,17 +30,49 @@ const pingNudgeWakeSocketDialTimeout = 200 * time.Millisecond
 // and the per-session poller in legacy mode each guarantee eventual
 // delivery without the wake.
 func pingNudgeWakeSocket(cityPath string) {
-	if cityPath == "" {
-		return
-	}
-	path := nudgequeue.WakeSocketPath(cityPath)
-	conn, err := net.DialTimeout("unix", path, pingNudgeWakeSocketDialTimeout)
+	conn, err := dialNudgeWakeSocket(cityPath)
 	if err != nil {
 		return
 	}
 	defer conn.Close() //nolint:errcheck // best-effort signaling
 	_ = conn.SetWriteDeadline(time.Now().Add(pingNudgeWakeSocketDialTimeout))
 	_, _ = conn.Write([]byte{1})
+}
+
+// dialNudgeWakeSocket dials the supervisor's nudge wake socket for cityPath.
+// It returns an error for an empty cityPath, a missing socket, or a dial
+// timeout — the same "nobody is listening" outcome pingNudgeWakeSocket and
+// nudgeDispatcherIsHosting both treat as no dispatcher hosting.
+func dialNudgeWakeSocket(cityPath string) (net.Conn, error) {
+	if cityPath == "" {
+		return nil, errNudgeWakeSocketNoCityPath
+	}
+	path := nudgequeue.WakeSocketPath(cityPath)
+	return net.DialTimeout("unix", path, pingNudgeWakeSocketDialTimeout)
+}
+
+var errNudgeWakeSocketNoCityPath = errors.New("nudge wake socket: empty city path")
+
+// nudgeDispatcherIsHosting reports whether a supervisor-hosted nudge
+// dispatcher is actually listening on the wake socket for cityPath, not
+// merely configured for supervisor mode (nudgeDispatcherIsSupervisor answers
+// that weaker, configuration-only question). A successful dial is the only
+// signal treated as hosting: startNudgeWakeListener returns nil, nil when it
+// cannot open the socket even while a dispatcher process is alive and
+// falling back to patrol-interval dispatching, so a failed dial does not
+// prove absence. Callers must therefore only trust this for suppressing a
+// fallback poller — never infer hosting from anything weaker than a live
+// positive signal. A false negative here starts a poller alongside a live
+// dispatcher (a harmless duplicate delivery attempt); a false positive would
+// suppress the only deliverer and silently strand queued nudges, so this
+// function is written to never produce one.
+func nudgeDispatcherIsHosting(cityPath string) bool {
+	conn, err := dialNudgeWakeSocket(cityPath)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // startNudgeWakeListener opens the supervisor wake socket and spawns an

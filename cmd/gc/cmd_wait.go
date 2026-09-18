@@ -1261,10 +1261,10 @@ func dispatchReadyWaitNudges(cityPath string, store beads.Store, _ runtime.Provi
 	if strings.TrimSpace(cityPath) != "" {
 		cfg, _ = loadCityConfigWithoutBuiltinPackRefresh(cityPath, io.Discard)
 	}
-	return dispatchReadyWaitNudgesWithSnapshot(cityPath, cfg, cliSessionFrontDoor(store, cfg, cityPath), cliNudgesStore(store, cfg, cityPath), now, nil)
+	return dispatchReadyWaitNudgesWithSnapshot(cityPath, cliSessionFrontDoor(store, cfg, cityPath), cliNudgesStore(store, cfg, cityPath), now, nil)
 }
 
-func dispatchReadyWaitNudgesWithSnapshot(cityPath string, cfg *config.City, sessFront *sessionpkg.Store, nudges beads.NudgesStore, now time.Time, sessionBeads *sessionBeadSnapshot) error {
+func dispatchReadyWaitNudgesWithSnapshot(cityPath string, sessFront *sessionpkg.Store, nudges beads.NudgesStore, now time.Time, sessionBeads *sessionBeadSnapshot) error {
 	if sessionBeads == nil {
 		var err error
 		sessionBeads, err = loadSessionBeadSnapshot(sessFront.Store().Store)
@@ -1327,7 +1327,13 @@ func dispatchReadyWaitNudgesWithSnapshot(cityPath string, cfg *config.City, sess
 		// BuiltinAncestor at session-bead creation, so wrapped aliases
 		// already surface as their built-in family here. The provider
 		// fallback covers sessions created before provider_kind was stamped.
-		if waitNudgeProviderNeedsPoller(sessionInfo) && !nudgeDispatcherIsSupervisor(cfg) {
+		//
+		// nudgeDispatcherIsHosting checks the live wake socket rather than
+		// nudgeDispatcherIsSupervisor(cfg): a configured-but-dead dispatcher
+		// leaves this queued nudge with no deliverer otherwise. See
+		// nudgeDispatcherIsHosting's doc comment for the duplicate-delivery
+		// tradeoff this accepts to avoid that silent loss.
+		if waitNudgeProviderNeedsPoller(sessionInfo) && !nudgeDispatcherIsHosting(cityPath) {
 			if err := startNudgePoller(cityPath, waitNudgePollerKey(sessionInfo), sessionInfo.SessionNameMetadata); err != nil {
 				return fmt.Errorf("starting wait nudge poller: %w", err)
 			}

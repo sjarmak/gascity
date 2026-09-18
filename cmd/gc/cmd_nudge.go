@@ -1726,10 +1726,16 @@ func maybeStartNudgePoller(target nudgeTarget) {
 	// races concurrent acquirers — see reapStaleNudgePoller). Best-effort:
 	// never block a spawn.
 	_ = reapStaleNudgePollers(target.cityPath)
-	// Supervisor-hosted dispatcher owns delivery in supervisor mode; the
-	// per-session poller would race with it and reintroduce the bd-shellout
-	// load it was designed to eliminate.
-	if nudgeDispatcherIsSupervisor(target.cfg) {
+	// A supervisor-hosted dispatcher that is actually listening owns
+	// delivery; the per-session poller would race with it and reintroduce
+	// the bd-shellout load it was designed to eliminate. Configuration
+	// alone is not enough: a configured-but-dead dispatcher leaves queued
+	// nudges with no deliverer, so this checks the live wake socket rather
+	// than nudgeDispatcherIsSupervisor(target.cfg). If a dispatcher is
+	// hosting without a wake socket (startNudgeWakeListener's fallback
+	// path), the poller starts alongside it; the queue's flock-based access
+	// makes that duplicate delivery attempt harmless, unlike a lost nudge.
+	if nudgeDispatcherIsHosting(target.cityPath) {
 		return
 	}
 	// ACP session/prompt delivery requires the process that owns the
