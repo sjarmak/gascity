@@ -673,8 +673,10 @@ func validateSyntheticRepoFileSet(dir, repository string) error {
 // A repository's set derives entirely from content embedded in the running
 // binary, so it is memoized for the process lifetime the same way manifestCache
 // memoizes the per-pack manifests it is built from. Rebuilding it per call
-// re-walked every bundled pack's embed.FS on every config load. Callers must
-// treat the returned maps as read-only.
+// re-walked every bundled pack's embed.FS on every config load. The returned
+// maps are copies of the memoized sets: the memo is process-lifetime state
+// shared across every caller, so handing out the live maps would let one
+// caller's mutation corrupt validation for all the others.
 func syntheticRepoAllowedPaths(repository string) (map[string]struct{}, map[string]struct{}, error) {
 	if !KnownRepository(repository) {
 		// Not memoized, so the memo's key set stays bounded by the repositories
@@ -685,11 +687,20 @@ func syntheticRepoAllowedPaths(repository string) (map[string]struct{}, map[stri
 	}
 	if cached, ok := syntheticRepoAllowedPathsCache.Load(repository); ok {
 		sets := cached.(syntheticRepoPathSets)
-		return sets.files, sets.dirs, sets.err
+		return copyPathSet(sets.files), copyPathSet(sets.dirs), sets.err
 	}
 	files, dirs, err := computeSyntheticRepoAllowedPaths(repository)
 	syntheticRepoAllowedPathsCache.Store(repository, syntheticRepoPathSets{files: files, dirs: dirs, err: err})
-	return files, dirs, err
+	return copyPathSet(files), copyPathSet(dirs), err
+}
+
+// copyPathSet returns a shallow copy so callers can never mutate memoized state.
+func copyPathSet(set map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(set))
+	for k := range set {
+		out[k] = struct{}{}
+	}
+	return out
 }
 
 // syntheticRepoAllowedPathsCache memoizes the allowed-path sets by repository.

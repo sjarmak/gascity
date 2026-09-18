@@ -625,6 +625,33 @@ func TestSyntheticRepoAllowedPathsIsStable(t *testing.T) {
 	}
 }
 
+// TestSyntheticRepoAllowedPathsReturnsCopies pins that syntheticRepoAllowedPaths
+// hands out maps a caller can freely mutate without corrupting the memoized
+// allowlist that every other caller reads. Against the pre-fix code, which
+// returned the memoized maps by reference, this test fails: the injected
+// bogus entry survives into the next call.
+func TestSyntheticRepoAllowedPathsReturnsCopies(t *testing.T) {
+	repository := Repository
+
+	files, dirs, err := syntheticRepoAllowedPaths(repository)
+	if err != nil {
+		t.Fatalf("syntheticRepoAllowedPaths: %v", err)
+	}
+	files["bogus-injected-file"] = struct{}{}
+	dirs["bogus-injected-dir"] = struct{}{}
+
+	files2, dirs2, err := syntheticRepoAllowedPaths(repository)
+	if err != nil {
+		t.Fatalf("syntheticRepoAllowedPaths (second call): %v", err)
+	}
+	if _, ok := files2["bogus-injected-file"]; ok {
+		t.Fatal("mutating the returned file set corrupted the memoized allowlist")
+	}
+	if _, ok := dirs2["bogus-injected-dir"]; ok {
+		t.Fatal("mutating the returned dir set corrupted the memoized allowlist")
+	}
+}
+
 // assertPathSetsEqual reports every difference between a memoized path set and a
 // freshly computed one, so a mis-keyed memo names the paths it got wrong.
 func assertPathSetsEqual(t *testing.T, kind string, cached, fresh map[string]struct{}) {
