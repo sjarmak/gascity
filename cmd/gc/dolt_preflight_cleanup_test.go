@@ -242,7 +242,7 @@ func TestFileOpenedByAnyProcessFromProcFallsBackWhenUnixTableUnreadable(t *testi
 }
 
 func TestRemoveStaleManagedDoltSocketsWithoutLsofKeepsSocket(t *testing.T) {
-	socketPath := filepath.Join("/tmp", "dolt-preflight-cleanup-live-test.sock")
+	socketPath := filepath.Join(shortSocketTempDir(t, "gc-sock-"), "live.sock")
 	_ = os.Remove(socketPath)
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
