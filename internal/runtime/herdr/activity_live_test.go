@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/herdr/herdrtest"
 )
 
 // TestActivityLive drives GetLastActivity against a real herdr binary in an
@@ -49,11 +50,7 @@ func TestActivityLive(t *testing.T) {
 	paneID := firstPaneID(t, session)
 	report := func(state string) {
 		t.Helper()
-		out, err := exec.Command("herdr", "--session", session, "pane", "report-agent", paneID,
-			"--source", "gctest", "--agent", "act-a", "--state", state).CombinedOutput()
-		if err != nil {
-			t.Fatalf("pane report-agent %s: %v: %s", state, err, out)
-		}
+		herdrtest.ReportAgent(t, session, "act-a", state, func() string { return paneID })
 	}
 	report("idle")
 
@@ -110,11 +107,7 @@ func TestActivityLive(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = p.Stop("act-b") })
 	bPaneID := firstPaneID(t, session, paneID)
-	out, err := exec.Command("herdr", "--session", session, "pane", "report-agent", bPaneID,
-		"--source", "gctest", "--agent", "act-b", "--state", agentStatusUnknown).CombinedOutput()
-	if err != nil {
-		t.Fatalf("pane report-agent unknown: %v: %s", err, out)
-	}
+	herdrtest.ReportAgent(t, session, "act-b", agentStatusUnknown, func() string { return bPaneID })
 	waitActivity(t, p, "act-b", 5*time.Second, func(got time.Time) bool {
 		return !got.IsZero()
 	})

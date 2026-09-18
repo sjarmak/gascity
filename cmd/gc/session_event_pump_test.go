@@ -203,11 +203,34 @@ func TestSessionEventPumpResyncPokesAfterTrailingDelay(t *testing.T) {
 		// must collapse into one delayed poke, not poke per cycle — an
 		// immediate poke would land a reconcile inside the start wave that
 		// triggered the resubscribe.
+		armed := time.Now()
 		for i := 0; i < 5; i++ {
 			fp.emit(t, runtime.SessionEvent{Kind: runtime.SessionEventResync, Time: time.Now()})
 		}
-		assertNoPoke(t, pokeCh) // 100ms window: still inside the trailing delay
-		waitPoke(t, pokeCh)
+		synctest.Wait()
+		// The landing time is asserted exactly, the way
+		// TestSessionEventPumpResyncDeferralLandsExactlyAtTheCap already does
+		// for the cap: a loose "sometime before N" window stays green if
+		// production halves both resyncDelay and resyncMaxDefer, silently
+		// cutting the trailing-delay protection in half.
+		const step = 50 * time.Millisecond
+		const steps = 10
+		landed := false
+		for i := 0; i < steps && !landed; i++ {
+			select {
+			case <-pokeCh:
+				if elapsed := time.Since(armed); elapsed != pump.resyncDelay {
+					t.Fatalf("poke landed %v after the burst, want exactly the %v trailing delay", elapsed, pump.resyncDelay)
+				}
+				landed = true
+			default:
+				<-time.After(step)
+				synctest.Wait()
+			}
+		}
+		if !landed {
+			t.Fatalf("no poke within %v of bubble time after the burst", steps*step)
+		}
 		assertNoPoke(t, pokeCh) // burst coalesced: exactly one poke
 
 		// A later resync (e.g. server bounce reconnect) earns its own poke.

@@ -122,18 +122,6 @@ func ReportAgent(t *testing.T, herdrSession, agentName, state string, pane func(
 	})
 }
 
-// ReportAgentBestEffort is ReportAgent without test-fatal semantics, safe to
-// call from a helper goroutine where a t.Fatalf would be lost.
-func ReportAgentBestEffort(herdrSession, agentName, state string, pane func() string) {
-	paneID := pane()
-	if paneID == "" {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), reportAgentAttemptBound)
-	defer cancel()
-	_ = reportAgentCmd(ctx, herdrSession, paneID, agentName, state).Run()
-}
-
 // reportAgentAttemptBound bounds ONE report-agent invocation. Without it the
 // subprocess is unbounded, and an unbounded call inside Poll's condition means
 // Poll's own bound is never reached: the deadline case cannot be selected while

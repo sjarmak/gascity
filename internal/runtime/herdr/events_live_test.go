@@ -2,11 +2,11 @@ package herdr
 
 import (
 	"context"
-	"os/exec"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/herdr/herdrtest"
 )
 
 // waitForEvent drains the stream until an event matches, tolerating
@@ -73,11 +73,7 @@ func TestSessionEventsLive(t *testing.T) {
 	}
 	report := func(pane, state string) {
 		t.Helper()
-		out, err := exec.Command("herdr", "--session", session, "pane", "report-agent", pane,
-			"--source", "gctest", "--agent", "gctest", "--state", state).CombinedOutput()
-		if err != nil {
-			t.Fatalf("pane report-agent %s %s: %v: %s", pane, state, err, out)
-		}
+		herdrtest.ReportAgent(t, session, "gctest", state, func() string { return pane })
 	}
 	// Both translations are exercised live: a non-idle state arrives as the
 	// vocabulary-free change kind here, and evt-b forces idle below.

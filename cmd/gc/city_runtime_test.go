@@ -7630,8 +7630,45 @@ func TestNewCityRuntimeWiresAssignedWorkDeferTracker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse city_runtime.go: %v", err)
 	}
+
+	// Scope the scan to the (*CityRuntime).beadReconcileTick method body, and
+	// require the argument to be the bare identifier "cr.adt". Two mutations
+	// were executed against the prior, unscoped, receiver-blind version of
+	// this check and both stayed green:
+	//   1. replacing the argument with (&CityRuntime{}).adt — a SelectorExpr
+	//      whose .Sel.Name is still "adt" but whose receiver is a fresh,
+	//      disconnected value, not the tracker built by newCityRuntime.
+	//   2. deleting the real call from beadReconcileTick and adding an unused
+	//      function elsewhere in the file that merely contains the expected
+	//      call text — ast.Inspect over the whole file cannot distinguish
+	//      live code from a dead decoy.
+	// Anchoring on the specific method and the specific receiver identifier
+	// closes both: mutation 1 fails the receiver-identity check, and mutation
+	// 2's decoy function is outside beadReconcileTick, which the scan never
+	// enters.
+	var reconcileTick *ast.FuncDecl
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name == nil || fn.Name.Name != "beadReconcileTick" || fn.Recv == nil || len(fn.Recv.List) != 1 {
+			continue
+		}
+		star, ok := fn.Recv.List[0].Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		recvType, ok := star.X.(*ast.Ident)
+		if !ok || recvType.Name != "CityRuntime" {
+			continue
+		}
+		reconcileTick = fn
+		break
+	}
+	if reconcileTick == nil {
+		t.Fatal("city_runtime.go no longer defines (*CityRuntime).beadReconcileTick: cannot verify the tracker is handed to the reconcile pass")
+	}
+
 	handed := false
-	ast.Inspect(file, func(n ast.Node) bool {
+	ast.Inspect(reconcileTick, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -7641,14 +7678,18 @@ func TestNewCityRuntimeWiresAssignedWorkDeferTracker(t *testing.T) {
 			return true
 		}
 		sel, ok := call.Args[0].(*ast.SelectorExpr)
-		if ok && sel.Sel != nil && sel.Sel.Name == "adt" {
+		if !ok || sel.Sel == nil || sel.Sel.Name != "adt" {
+			return true
+		}
+		recv, ok := sel.X.(*ast.Ident)
+		if ok && recv.Name == "cr" {
 			handed = true
 			return false
 		}
 		return true
 	})
 	if !handed {
-		t.Fatal("city_runtime.go no longer hands the constructed tracker to the reconcile pass: the backstop is dead in production while every behavior test that drives the option directly stays green")
+		t.Fatal("(*CityRuntime).beadReconcileTick no longer hands cr.adt to the reconcile pass: the backstop is dead in production while every behavior test that drives the option directly stays green")
 	}
 }
 
