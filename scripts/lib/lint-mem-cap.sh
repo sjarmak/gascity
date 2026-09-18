@@ -85,6 +85,47 @@ gc_lint_mem_cap_available() {
   return 0
 }
 
+# gc_lint_mem_cap_report_kill prints a legible diagnostic to stderr when the
+# capped run died from something that looks like a cgroup memory kill. It is
+# only called for a non-zero exit that looks like a kill signal (128+N); a
+# normal golangci-lint failure (e.g. exit 1, lint findings) never reaches it.
+#
+# Confidence is worded to match what was actually checked: `Result=oom-kill`
+# on the transient scope unit is systemd's own record that THIS cgroup's
+# memory.events oom_kill counter fired (authoritative). Exit 137 (SIGKILL)
+# without that confirmation is consistent with a cap hit but not proof --
+# anything can send SIGKILL -- and the message says so rather than asserting
+# it. A death from any other signal is not the cap's signature at all and is
+# reported as unrelated.
+gc_lint_mem_cap_report_kill() {
+  local status="$1" unit="$2"
+  local sig=$((status - 128))
+  local result=""
+  if command -v systemctl >/dev/null 2>&1; then
+    result="$(systemctl --user show "${unit}.scope" -p Result --value 2>/dev/null || true)"
+  fi
+
+  local confidence
+  if [[ "$result" == "oom-kill" ]]; then
+    confidence="CONFIRMED: systemd recorded this run's cgroup as Result=oom-kill -- the kernel OOM-killed a process inside the memory ceiling below."
+  elif [[ "$sig" -eq 9 ]]; then
+    confidence="Exit $status is SIGKILL, which is consistent with hitting the memory ceiling below, but that is not proof by itself -- SIGKILL can come from other sources too, and systemd did not confirm Result=oom-kill for this run (${result:-no confirmation available})."
+  else
+    # Not the cap's signature (SIGKILL, or a confirmed oom-kill Result) --
+    # a different signal killed this, unrelated to the memory fence. Say
+    # nothing further; the caller's own exit status already reports it.
+    return 0
+  fi
+
+  cat >&2 <<EOF
+gc_lint_mem_cap: golangci-lint died under a memory cap (exit $status, signal $sig).
+  $confidence
+  A memory cap was applied on purpose, not incidental: GC_LINT_MEMORY_MAX=$GC_LINT_MEMORY_MAX (set by the GC_LINT_MEMORY_MAX env var), GC_LINT_MEMORY_SWAP_MAX=$GC_LINT_MEMORY_SWAP_MAX (GC_LINT_MEMORY_SWAP_MAX).
+  Where 7G came from: measured golangci-lint peaks on this repo range 5.40-9.85 GiB depending on scope and GOMEMLIMIT; 7G sits above the capped peak (so a normal run passes) and below the uncapped peak (so it actually binds). Full measurements are in this file's header comment.
+  Your options: raise the ceiling for this run only, e.g. GC_LINT_MEMORY_MAX=10G <command>; or reduce the lint scope (fewer packages, or set GC_LINT_GOMEMLIMIT lower) so it fits under the current cap.
+EOF
+}
+
 gc_lint_mem_cap_exec() {
   local status
   # gc_lint_mem_cap_available returns non-zero for every non-"ok" outcome,
@@ -95,9 +136,28 @@ gc_lint_mem_cap_exec() {
   status="$(gc_lint_mem_cap_available)" || true
   case "$status" in
     ok)
-      exec systemd-run --user --scope --collect --quiet \
+      # Do NOT exec here. Execing replaces this process, so if the capped
+      # command gets OOM-killed there is nothing left running to explain
+      # why -- the caller just sees a bare exit 137. Run it as a child
+      # instead, so this function is still alive to report on the way out.
+      # A named unit (no --collect) lets us read the scope's own
+      # Result=oom-kill afterward; it is reset-failed below either way so
+      # transient units don't accumulate.
+      local unit="gc-lint-mem-cap-$$-$RANDOM"
+      local run_status
+      set +e
+      systemd-run --user --scope --quiet --unit="$unit" \
         -p MemoryMax="$GC_LINT_MEMORY_MAX" \
         -p MemorySwapMax="$GC_LINT_MEMORY_SWAP_MAX" -- "$@"
+      run_status=$?
+      set -e
+      if [[ "$run_status" -gt 128 ]]; then
+        gc_lint_mem_cap_report_kill "$run_status" "$unit"
+      fi
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user reset-failed "${unit}.scope" >/dev/null 2>&1 || true
+      fi
+      return "$run_status"
       ;;
     bad-value)
       echo "gc_lint_mem_cap: GC_LINT_MEMORY_MAX=$GC_LINT_MEMORY_MAX / GC_LINT_MEMORY_SWAP_MAX=$GC_LINT_MEMORY_SWAP_MAX was rejected; refusing to run golangci-lint without a working memory cap. systemd's MemoryMax=/MemorySwapMax= want a byte count, a K/M/G/T suffix with no 'i' and no trailing 'B' (e.g. 7G, not 7GiB or 7GB), or are rejected outright if set to 'infinity' (unlimited never binds)." >&2

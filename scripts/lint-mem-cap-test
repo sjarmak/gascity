@@ -208,6 +208,25 @@ fi
 if [[ "$real_invocation" != *"-p MemorySwapMax=100M"* ]]; then
   fail "C1: real systemd-run invocation missing -p MemorySwapMax=100M: $real_invocation"
 fi
+# gc-vrva1q round 2: a cap-hit kill must be a legible stderr diagnostic, not
+# a bare exit code -- the whole point being that a seat that hits the cap
+# can read why, without reading this script. The fake systemd-run enforces
+# the kill exactly like the real cgroup would (SIGKILL, exit 137); no
+# systemctl exists on this scenario's PATH, so this also exercises the
+# SIGKILL-consistent-but-unconfirmed fallback wording, not the confirmed
+# Result=oom-kill path.
+if ! grep -qi "memory cap" <<<"$out"; then
+  fail "C1: cap-hit kill did not report a legible memory-cap diagnostic on stderr: $out"
+fi
+if [[ "$out" != *"GC_LINT_MEMORY_MAX=300M"* ]]; then
+  fail "C1: cap-hit diagnostic did not name the value in force: $out"
+fi
+if ! grep -qi "GC_LINT_MEMORY_MAX" <<<"$out"; then
+  fail "C1: cap-hit diagnostic did not name the variable that sets the cap: $out"
+fi
+if ! grep -qiE "raise|reduce" <<<"$out"; then
+  fail "C1: cap-hit diagnostic did not tell the reader their options: $out"
+fi
 
 # ── C2: a value systemd rejects is a hard failure, command never runs ───
 scenario="$work/bad-value"
