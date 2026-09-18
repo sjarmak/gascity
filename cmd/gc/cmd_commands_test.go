@@ -2786,7 +2786,7 @@ func TestPackCommandExitReturnsThroughRun(t *testing.T) {
 			if got, want := result.stdout, "pack-before-exit\n"; got != want {
 				t.Fatalf("helper stdout = %q, want %q", got, want)
 			}
-			if got := result.stderr; got != "" {
+			if got := stripLeakGuardNoise(result.stderr); got != "" {
 				t.Fatalf("helper stderr = %q, want empty", got)
 			}
 		})
