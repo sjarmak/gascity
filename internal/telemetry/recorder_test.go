@@ -135,8 +135,50 @@ func TestRecordNudge(t *testing.T) {
 	resetInstruments(t)
 	ctx := context.Background()
 
-	RecordNudge(ctx, "agent1", nil)
-	RecordNudge(ctx, "agent2", errors.New("nudge error"))
+	RecordNudge(ctx, "agent1", "bead-1", nil)
+	RecordNudge(ctx, "agent2", "", errors.New("nudge error"))
+}
+
+// TestRecordNudgeCarriesCallerIdentity locks in the gc-35ywwh contract: the
+// caller-supplied identity is the key a reader later queries one nudge's
+// delivery state back by, so it must land on the emitted event untouched
+// when supplied, and must not be synthesized from target when the caller
+// has none to give.
+func TestRecordNudgeCarriesCallerIdentity(t *testing.T) {
+	resetInstruments(t)
+	exp := installRecordingLogExporter(t)
+	ctx := context.Background()
+
+	RecordNudge(ctx, "worker-1", "gc-35ywwh", nil)
+
+	rec := exp.recordByBody("session.nudge")
+	if rec == nil {
+		t.Fatal("RecordNudge did not emit session.nudge")
+	}
+	attrs := recordAttrs(*rec)
+	if got := attrs["identity"].AsString(); got != "gc-35ywwh" {
+		t.Fatalf("session.nudge identity = %q, want gc-35ywwh", got)
+	}
+	if got := attrs["target"].AsString(); got != "worker-1" {
+		t.Fatalf("session.nudge target = %q, want worker-1", got)
+	}
+}
+
+func TestRecordNudgeOmitsIdentityWhenCallerHasNone(t *testing.T) {
+	resetInstruments(t)
+	exp := installRecordingLogExporter(t)
+	ctx := context.Background()
+
+	RecordNudge(ctx, "worker-2", "", nil)
+
+	rec := exp.recordByBody("session.nudge")
+	if rec == nil {
+		t.Fatal("RecordNudge did not emit session.nudge")
+	}
+	attrs := recordAttrs(*rec)
+	if _, ok := attrs["identity"]; ok {
+		t.Fatalf("session.nudge carried an identity attribute %q for a caller that supplied none; it must never be synthesized from target", attrs["identity"].AsString())
+	}
 }
 
 func TestRecordConfigReload(t *testing.T) {

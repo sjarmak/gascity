@@ -1699,7 +1699,7 @@ func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Stor
 				Wake:     worker.NudgeWakeLiveOnly,
 			})
 			if nudgeErr == nil && result.Delivered {
-				telemetry.RecordNudge(context.Background(), target.agent.QualifiedName(), nil)
+				telemetry.RecordNudge(context.Background(), target.agent.QualifiedName(), target.sessionName, nil)
 				var sessFront *session.Store
 				if store != nil {
 					sessFront = cliSessionFrontDoor(store, target.cfg, target.cityPath)
@@ -1712,7 +1712,7 @@ func deliverSlingNudge(target nudgeTarget, sp runtime.Provider, store beads.Stor
 	}
 
 	if err := enqueueQueuedNudgeWithStore(target.cityPath, cliNudgesStore(store, target.cfg, target.cityPath), newQueuedNudgeWithOptions(target.agent.QualifiedName(), msg, "sling", now, queuedNudgeOptionsFromTarget(target))); err != nil {
-		telemetry.RecordNudge(context.Background(), target.agent.QualifiedName(), err)
+		telemetry.RecordNudge(context.Background(), target.agent.QualifiedName(), target.sessionName, err)
 		fmt.Fprintf(stderr, "warning: bead routed but nudge failed: %v\n", err) //nolint:errcheck // best-effort
 		return
 	}

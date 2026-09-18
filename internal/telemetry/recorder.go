@@ -383,8 +383,13 @@ func RecordReconcileCycle(ctx context.Context, started int) {
 	)
 }
 
-// RecordNudge records a session nudge send (metrics + log event).
-func RecordNudge(ctx context.Context, target string, err error) {
+// RecordNudge records a session nudge send (metrics + log event). identity
+// is the caller-supplied key (typically the session/bead id) a reader later
+// queries this nudge's delivery state back by; callers that genuinely have
+// no identity to supply pass "" and it is omitted from the event rather than
+// defaulted to target, which would collapse distinct identities that happen
+// to share a runtime session name (gc-35ywwh).
+func RecordNudge(ctx context.Context, target, identity string, err error) {
 	initInstruments()
 	status := statusStr(err)
 	inst.nudgeTotal.Add(ctx, 1,
@@ -393,11 +398,15 @@ func RecordNudge(ctx context.Context, target string, err error) {
 			attribute.String("status", status),
 		),
 	)
-	emit(ctx, "session.nudge", severity(err),
+	fields := []otellog.KeyValue{
 		otellog.String("target", target),
 		otellog.String("status", status),
-		errKV(err),
-	)
+	}
+	if identity != "" {
+		fields = append(fields, otellog.String("identity", identity))
+	}
+	fields = append(fields, errKV(err))
+	emit(ctx, "session.nudge", severity(err), fields...)
 }
 
 // RecordConfigReload records a config reload attempt (metrics + log event).

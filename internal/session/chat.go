@@ -820,14 +820,20 @@ func formatWaitIdleReminder(source, message string) string {
 	return sb.String()
 }
 
-func (m *Manager) nudgeSession(ctx context.Context, sessName, message string, immediate bool) error {
+// nudgeSession sends content to sessName and records the delivery outcome
+// against identity, the caller-supplied key a reader later queries a single
+// nudge's delivery state back by (gc-35ywwh). identity is the session/bead
+// id driving this nudge, not a per-attempt token: the reconciler's step-2
+// design (dr-3msk6.1) reads the latest delivery state for one session, not
+// a history of individual sends.
+func (m *Manager) nudgeSession(ctx context.Context, sessName, identity, message string, immediate bool) error {
 	content := runtime.TextContent(message)
 	err := m.nudgeContent(sessName, content, immediate)
 	recordCtx := ctx
 	if recordCtx == nil || recordCtx.Err() != nil {
 		recordCtx = context.Background()
 	}
-	telemetry.RecordNudge(recordCtx, sessName, err)
+	telemetry.RecordNudge(recordCtx, sessName, identity, err)
 	if err != nil {
 		return fmt.Errorf("sending message to session: %w", err)
 	}
@@ -856,7 +862,7 @@ func (m *Manager) tryWaitIdleNudgeLocked(ctx context.Context, id string, b beads
 		if err := m.ensureRunning(ctx, id, b, sessName, resumeCommand, hints); err != nil {
 			return false, err
 		}
-		if err := m.nudgeSession(ctx, sessName, message, false); err != nil {
+		if err := m.nudgeSession(ctx, sessName, id, message, false); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -874,18 +880,18 @@ func (m *Manager) tryWaitIdleNudgeLocked(ctx context.Context, id string, b beads
 	if err := waiter.WaitForIdle(ctx, sessName, waitIdleNudgeTimeout); err != nil {
 		return false, nil
 	}
-	if err := m.nudgeSession(ctx, sessName, formatWaitIdleReminder(normalizeWaitIdleNudgeSource(source), message), true); err != nil {
+	if err := m.nudgeSession(ctx, sessName, id, formatWaitIdleReminder(normalizeWaitIdleNudgeSource(source), message), true); err != nil {
 		return false, nil
 	}
 	return true, nil
 }
 
-func (m *Manager) tryWaitIdleNudgeLiveOnlyLocked(ctx context.Context, b beads.Bead, source, sessName, message string) (bool, error) {
+func (m *Manager) tryWaitIdleNudgeLiveOnlyLocked(ctx context.Context, id string, b beads.Bead, source, sessName, message string) (bool, error) {
 	if !m.sp.IsRunning(sessName) {
 		return false, nil
 	}
 	if transportFromMetadata(b) == "acp" {
-		if err := m.nudgeSession(ctx, sessName, message, false); err != nil {
+		if err := m.nudgeSession(ctx, sessName, id, message, false); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -900,7 +906,7 @@ func (m *Manager) tryWaitIdleNudgeLiveOnlyLocked(ctx context.Context, b beads.Be
 	if err := waiter.WaitForIdle(ctx, sessName, waitIdleNudgeTimeout); err != nil {
 		return false, nil
 	}
-	if err := m.nudgeSession(ctx, sessName, formatWaitIdleReminder(normalizeWaitIdleNudgeSource(source), message), true); err != nil {
+	if err := m.nudgeSession(ctx, sessName, id, formatWaitIdleReminder(normalizeWaitIdleNudgeSource(source), message), true); err != nil {
 		return false, nil
 	}
 	return true, nil
@@ -949,7 +955,7 @@ func (m *Manager) sendLocked(ctx context.Context, id string, b beads.Bead, sessN
 	if err := m.pendingInteractionLocked(sessName); err != nil {
 		return err
 	}
-	if err := m.nudgeSession(ctx, sessName, message, immediate); err != nil {
+	if err := m.nudgeSession(ctx, sessName, id, message, immediate); err != nil {
 		return err
 	}
 	if verifyDeferredDialogs && m.dismissKnownDialogsLocked(ctx, sessName, codexDeferredDialogDelay) {
@@ -979,7 +985,7 @@ func (m *Manager) sendLiveOnly(ctx context.Context, id, message string, immediat
 			delivered = false
 			return nil
 		}
-		if err := m.nudgeSession(ctx, sessName, message, immediate); err != nil {
+		if err := m.nudgeSession(ctx, sessName, id, message, immediate); err != nil {
 			return err
 		}
 		delivered = true
@@ -1069,7 +1075,7 @@ func (m *Manager) TryWaitIdleNudgeLiveOnly(ctx context.Context, id, source, mess
 		if err != nil {
 			return err
 		}
-		delivered, err = m.tryWaitIdleNudgeLiveOnlyLocked(ctx, b, source, sessName, message)
+		delivered, err = m.tryWaitIdleNudgeLiveOnlyLocked(ctx, id, b, source, sessName, message)
 		return err
 	})
 	return delivered, err

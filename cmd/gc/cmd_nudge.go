@@ -1366,7 +1366,7 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 			// path below and duplicate the mail notification.
 			unobservedButDelivered := errors.Is(nudgeErr, tmux.ErrNudgeSubmitDeliveredUnobserved)
 			if delivered || unobservedButDelivered {
-				telemetry.RecordNudge(context.Background(), target.agentKey(), nil)
+				telemetry.RecordNudge(context.Background(), target.agentKey(), target.sessionID, nil)
 				var sessFront *session.Store
 				if store != nil {
 					sessFront = sessionFrontDoor(sessStore)
@@ -1633,7 +1633,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 		Wake:     worker.NudgeWakeLiveOnly,
 	})
 	if err != nil {
-		telemetry.RecordNudge(context.Background(), target.agentKey(), err)
+		telemetry.RecordNudge(context.Background(), target.agentKey(), target.sessionID, err)
 		if errors.Is(err, runtime.ErrSessionNotFound) {
 			if recErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items)); recErr != nil {
 				return false, errors.Join(bookkeepErr, recErr)
@@ -1662,7 +1662,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 		relErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items))
 		return false, errors.Join(bookkeepErr, relErr)
 	}
-	telemetry.RecordNudge(context.Background(), target.agentKey(), nil)
+	telemetry.RecordNudge(context.Background(), target.agentKey(), target.sessionID, nil)
 	stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
 	return true, errors.Join(bookkeepErr, ackQueuedNudges(target.cityPath, queuedNudgeIDs(items)))
 }
