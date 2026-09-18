@@ -2309,12 +2309,14 @@ func scaleCheckPartialSessionPreservableInfo(i session.Info) bool {
 }
 
 // scaleCheckPartialSessionRetainableInfo counts active/awake affected-template
-// beads as retained demand during transient scale_check failures. A fresh
-// in-flight create that still holds an active pending_create_claim lease also
-// counts as retained capacity; stale creates (lease expired/cleared) do not, so
-// they stop inflating the desired count. It reads the raw state metadata
-// (Info.MetadataState) and delegates the in-flight-create case to
-// isPendingPoolCreateInfo.
+// beads as retained demand during transient scale_check failures. An
+// in-flight create whose pending_create_claim flag is still set also counts
+// as retained capacity via isPendingPoolCreateInfo; that predicate tests the
+// flag only, not lease expiry, so once the reconciler clears an expired claim
+// (session_reconcile.go, pendingCreateLeaseExpiredForRollbackInfo) the stale
+// create stops inflating the desired count, with at most one tick of lag. It
+// reads the raw state metadata (Info.MetadataState) and delegates the
+// in-flight-create case to isPendingPoolCreateInfo.
 func scaleCheckPartialSessionRetainableInfo(i session.Info) bool {
 	switch strings.TrimSpace(i.MetadataState) {
 	case "active", "awake":
@@ -2900,10 +2902,14 @@ func discoverSessionBeadsWithRoots(
 				continue
 			}
 			// Use a narrower partial-alive guard than scaleCheckPartial here: for
-			// creating/start-pending beads, only protect in-flight creates with an
-			// active pending_create_claim lease; stale creates (lease cleared/expired)
-			// roll back even during a partial tick. For all other states (active, awake,
-			// asleep, stopped, …) the broad preservable rule applies unchanged.
+			// creating/start-pending beads, only protect in-flight creates whose
+			// pending_create_claim flag is still set (isPendingPoolCreateInfo tests
+			// the flag only; lease expiry is the reconciler's job, via
+			// pendingCreateLeaseExpiredForRollbackInfo in session_reconcile.go, and a
+			// claim it has cleared reads as unset here already). Stale creates whose
+			// claim has been cleared roll back even during a partial tick. For all
+			// other states (active, awake, asleep, stopped, …) the broad preservable
+			// rule applies unchanged.
 			poolPartialAlive := (poolScaleCheckPartial || namedScaleCheckPartial) &&
 				(isPendingPoolCreateInfo(info) || (!creating && scaleCheckPartialSessionPreservableInfo(info)))
 			if controllerManagedPool && !manualSession && !isNamedSessionInfo(info) &&
@@ -3004,8 +3010,13 @@ func discoverSessionBeadsWithRoots(
 	return roots
 }
 
-// isPendingPoolCreateInfo reports whether a pool-managed session is an in-flight
-// create still holding an active pending_create_claim lease.
+// isPendingPoolCreateInfo reports whether a pool-managed session carries the
+// pending_create_claim flag. It tests the flag only; it does not check lease
+// expiry, since this pass is deliberately clock-free (see the comment on
+// pool_desired_state.go). Lease ownership belongs to the reconciler
+// (session_reconcile.go, via pendingCreateLeaseExpiredForRollbackInfo), which
+// clears an expired claim there; this predicate then sees the cleared flag on
+// its next read, with at most one tick of lag.
 func isPendingPoolCreateInfo(i session.Info) bool {
 	return isPoolManagedSessionInfo(i) && i.PendingCreateClaim
 }
