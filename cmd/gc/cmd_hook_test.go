@@ -791,6 +791,67 @@ func TestDoHookClaimStampsWorkBranch(t *testing.T) {
 	}
 }
 
+// TestDoHookClaimStampsWorkBranchWithoutRealGitProbe is the regression case
+// for gc-h0hqjx: TestDoHookClaimStampsWorkBranch passes a literal nonexistent
+// store dir ("/tmp/work") through doHookClaim, and before ResolveHeadRepoDir
+// existed as a seam, the exclusion logic in hookClaimStoreHead.Admit
+// (cmd_hook_claim.go) always resolved both that store dir and the candidate
+// work dir by shelling out to a real `git ... rev-parse --absolute-git-dir`
+// bounded by hookClaimGitProbeTimeout (5s). Under a loaded full ./... run
+// that probe can outlive its deadline, get classified
+// hookClaimProbeUnavailable instead of hookClaimProbeAbsent, and Admit
+// refuses on any non-Absent probe -- so the stamp silently disappears,
+// exactly as observed: "stamp = bead "hw-stamp" branch "" ... want
+// hw-stamp/bd-hw-stamp/worker-1".
+//
+// This test proves the fix without depending on load or timing: it removes
+// git from PATH entirely, so any accidental fallback to a real git
+// subprocess fails loudly (exec: "git": executable file not found in $PATH,
+// classified hookClaimProbeUnavailable) rather than passing by chance. It
+// supplies its own ResolveHeadRepoDir instead, matching what a real git probe
+// answers for both dirs when neither is a repository
+// (hookClaimProbeAbsent, no repo dir) -- and asserts the stamp lands.
+func TestDoHookClaimStampsWorkBranchWithoutRealGitProbe(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+
+	var stampedBead, stampedBranch, stampedAssignee string
+	runner := func(string, string) (string, error) {
+		return `[{"id":"hw-stamp","status":"open","metadata":{"gc.routed_to":"worker"}}]`, nil
+	}
+	ops := hookClaimOps{
+		Runner: runner,
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{
+				"gc.routed_to": "worker",
+				"gc.work_dir":  "/worktrees/hw-stamp",
+			}}, true, nil
+		},
+		ResolveWorkBranch: func(hookClaimWorkTree) string { return "bd-hw-stamp" },
+		ResolveHeadRepoDir: func(string) (string, hookClaimProbe) {
+			return "", hookClaimProbeAbsent
+		},
+		StampWorkMeta: func(_ context.Context, _ string, _ []string, beadID, assignee string, patch map[string]string) error {
+			stampedBead, stampedAssignee, stampedBranch = beadID, assignee, patch["gc.work_branch"]
+			return nil
+		},
+	}
+	opts := hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"worker"},
+		JSON:               true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim(stamp) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if stampedBead != "hw-stamp" || stampedBranch != "bd-hw-stamp" || stampedAssignee != "worker-1" {
+		t.Fatalf("stamp = bead %q branch %q assignee %q, want hw-stamp/bd-hw-stamp/worker-1 (git-probe timeout under load, gc-h0hqjx)", stampedBead, stampedBranch, stampedAssignee)
+	}
+}
+
 // TestDoHookClaimSkipsStampWhenBranchUnchanged guards the idempotent path: a
 // claim whose bead already carries the resolved branch AND a prior
 // gc.claimed_at performs no stamp write. gc.claimed_at must be preset here too

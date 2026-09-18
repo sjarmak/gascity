@@ -277,6 +277,16 @@ type hookClaimOps struct {
 	// (ga-7rj87d FR5) after a successful reclaim-then-claim in the same
 	// cycle. Best-effort, like the other Emit* seams.
 	EmitHookClaimReclaimedStale func(beadID, previousOwner, newAssignee string)
+	// ResolveHeadRepoDir answers hookClaimHeadRepoDir's question (which
+	// repository, if any, a directory's HEAD would be read from) for both the
+	// store exclusion and every candidate it admits or refuses. It is a seam
+	// for the same reason ResolveWorkBranch is: identity resolution here is
+	// plumbing over a directory string, not a git question a test should have
+	// to answer by shelling out. Defaulting to hookClaimHeadRepoDir keeps
+	// production behavior unchanged; a test that supplies its own avoids the
+	// real subprocess entirely instead of depending on it completing inside
+	// hookClaimGitProbeTimeout on whatever box happens to run it (gc-h0hqjx).
+	ResolveHeadRepoDir hookResolveHeadRepoDirFunc
 }
 
 type (
@@ -288,6 +298,7 @@ type (
 	hookEmitClaimRejectedFunc     func(beadID, existingClaimant, attemptedClaimant string)
 	hookResolveWorkBranchFunc     func(tree hookClaimWorkTree) string
 	hookResolveSessionWorkDirFunc func(sessionID string) string
+	hookResolveHeadRepoDirFunc    func(dir string) (string, hookClaimProbe)
 	hookStampWorkMetaFunc         func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
 	hookStampSessionClaimFunc     func(sessionID, beadID string) error
 	hookPublishRunMapFunc         func(runID, beadID string, sessionKeys ...string) error
@@ -507,6 +518,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.ResolveWorkBranch == nil {
 		ops.ResolveWorkBranch = hookResolveWorkBranch
+	}
+	if ops.ResolveHeadRepoDir == nil {
+		ops.ResolveHeadRepoDir = hookClaimHeadRepoDir
 	}
 	if ops.ResolveSessionWorkDir == nil {
 		ops.ResolveSessionWorkDir = hookResolveSessionWorkDir
@@ -1520,7 +1534,7 @@ func hookClaimIdentityPatch(bead beads.Bead, opts hookClaimOptions, ops hookClai
 	sessionID := hookClaimSessionID(opts.Env)
 	isControl := beadmeta.IsControlKind(strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey]))
 
-	storeHead := hookClaimResolveStoreHead(dir)
+	storeHead := hookClaimResolveStoreHeadWith(dir, ops.ResolveHeadRepoDir)
 	trees := hookClaimWorkerTrees(bead, storeHead)
 	// A pool-routed bead records no checkout at all, so fall back to the checkout
 	// of the claiming session (gc-2n4c). Only as a fallback: a recorded value is
@@ -1645,16 +1659,40 @@ type hookClaimStoreHead struct {
 	// whether the query that produced it actually answered.
 	repoDir string
 	probe   hookClaimProbe
+	// resolve answers hookClaimHeadRepoDir's question for the store itself and
+	// for every candidate Admit is asked about, so the two agree on how a
+	// directory's repository is discovered. It travels with the value instead
+	// of being looked up again so a test that supplies its own resolver
+	// through hookClaimOps.ResolveHeadRepoDir covers Admit's own probe too,
+	// not just the store's.
+	resolve hookResolveHeadRepoDirFunc
 }
 
-// hookClaimResolveStoreHead probes storeDir once and returns its identity.
+// hookClaimResolveStoreHead probes storeDir once, through hookClaimHeadRepoDir,
+// and returns its identity. This is the fixed-resolver entry point the
+// exclusion-logic tests in cmd_hook_claim_work_branch_test.go exercise
+// directly against real git, so its signature stays as-is; the claim path
+// itself goes through hookClaimResolveStoreHeadWith so it can be handed an
+// injected resolver instead.
 func hookClaimResolveStoreHead(storeDir string) hookClaimStoreHead {
+	return hookClaimResolveStoreHeadWith(storeDir, hookClaimHeadRepoDir)
+}
+
+// hookClaimResolveStoreHeadWith probes storeDir once, through resolve, and
+// returns its identity, defaulting resolve to hookClaimHeadRepoDir when nil so
+// its behavior matches Admit's own fallback (applyDefaults fills
+// hookClaimOps.ResolveHeadRepoDir with hookClaimHeadRepoDir, so resolve is
+// never actually nil on the production claim path).
+func hookClaimResolveStoreHeadWith(storeDir string, resolve hookResolveHeadRepoDirFunc) hookClaimStoreHead {
+	if resolve == nil {
+		resolve = hookClaimHeadRepoDir
+	}
 	store := strings.TrimSpace(storeDir)
-	head := hookClaimStoreHead{dir: store, probe: hookClaimProbeAbsent}
+	head := hookClaimStoreHead{dir: store, probe: hookClaimProbeAbsent, resolve: resolve}
 	if store == "" {
 		return head
 	}
-	head.repoDir, head.probe = hookClaimHeadRepoDir(store)
+	head.repoDir, head.probe = resolve(store)
 	return head
 }
 
@@ -1675,11 +1713,21 @@ func (s hookClaimStoreHead) Admit(candidate string) (hookClaimWorkTree, bool) {
 	if cand == "" {
 		return hookClaimWorkTree{}, false
 	}
+	// resolve defaults to the real git probe so a value built as
+	// hookClaimStoreHead{...} directly (every case in
+	// cmd_hook_claim_work_branch_test.go, which tests this exclusion logic
+	// against real fixtures) behaves exactly as it did before resolve
+	// existed. Only hookClaimResolveStoreHeadWith populates resolve with
+	// something else.
+	resolve := s.resolve
+	if resolve == nil {
+		resolve = hookClaimHeadRepoDir
+	}
 	if s.dir == "" {
 		// No store was named, so there is nothing to exclude. The candidate still
 		// has to be identified, because the branch is read from the repository that
 		// answers for it rather than from the path a second time.
-		repo, probe := hookClaimHeadRepoDir(cand)
+		repo, probe := resolve(cand)
 		if probe != hookClaimProbeAnswered {
 			return hookClaimWorkTree{Dir: cand}, true
 		}
@@ -1698,7 +1746,7 @@ func (s hookClaimStoreHead) Admit(candidate string) (hookClaimWorkTree, bool) {
 		return hookClaimWorkTree{}, false
 	}
 
-	candRepo, candProbe := hookClaimHeadRepoDir(cand)
+	candRepo, candProbe := resolve(cand)
 	switch candProbe {
 	case hookClaimProbeAbsent:
 		// git ran and reported that no repository covers this candidate. Usually
