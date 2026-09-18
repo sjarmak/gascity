@@ -683,7 +683,13 @@ func TestHookClaimStoreHeadComparesRepositoriesNotPaths(t *testing.T) {
 // The deadline has to be checked before the run error, because a query the context
 // kills still surfaces as an ExitError.
 func TestHookClaimClassifyGitOutputSeparatesAnsweredFromNotAsked(t *testing.T) {
-	exitErr := &exec.ExitError{ProcessState: &os.ProcessState{}}
+	exitErrWith := func(stderr string) *exec.ExitError {
+		return &exec.ExitError{ProcessState: &os.ProcessState{}, Stderr: []byte(stderr)}
+	}
+	notARepo := exitErrWith("fatal: not a git repository (or any of the parent directories): .git\n")
+	cannotChangeTo := exitErrWith("fatal: cannot change to '/does/not/exist': No such file or directory\n")
+	dubious := exitErrWith("fatal: detected dubious ownership in repository at '/repo'\n")
+	noStderr := exitErrWith("")
 	startErr := &exec.Error{Name: "git", Err: exec.ErrNotFound}
 
 	for _, tc := range []struct {
@@ -695,8 +701,11 @@ func TestHookClaimClassifyGitOutputSeparatesAnsweredFromNotAsked(t *testing.T) {
 		wantProbe hookClaimProbe
 	}{
 		{"a value came back", nil, nil, "/repo/.git\n", "/repo/.git", hookClaimProbeAnswered},
-		{"git ran and reported nothing here", nil, exitErr, "", "", hookClaimProbeAbsent},
-		{"the deadline expired", context.DeadlineExceeded, exitErr, "", "", hookClaimProbeUnavailable},
+		{"git ran and said in so many words there is no repository", nil, notARepo, "", "", hookClaimProbeAbsent},
+		{"git could not even change to the directory", nil, cannotChangeTo, "", "", hookClaimProbeAbsent},
+		{"git ran and refused for dubious ownership", nil, dubious, "", "", hookClaimProbeDeclined},
+		{"git exited nonzero with nothing on stderr to read", nil, noStderr, "", "", hookClaimProbeDeclined},
+		{"the deadline expired", context.DeadlineExceeded, notARepo, "", "", hookClaimProbeUnavailable},
 		{"the caller canceled", context.Canceled, nil, "/repo/.git\n", "", hookClaimProbeUnavailable},
 		{"git could not be started", nil, startErr, "", "", hookClaimProbeUnavailable},
 		{"git exited cleanly with nothing to say", nil, nil, "  \n", "", hookClaimProbeUnavailable},
@@ -984,10 +993,10 @@ func TestHookClaimRefusesTheStoreWhenGitDeclinesToAnswer(t *testing.T) {
 	t.Setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
 
 	store := hookClaimResolveStoreHead(f.store)
-	if store.probe != hookClaimProbeAbsent {
-		t.Fatalf("the store probe is %v; this case needs git to refuse it with an exit status", store.probe)
+	if store.probe != hookClaimProbeDeclined {
+		t.Fatalf("the store probe is %v; this case needs git to refuse it with a dubious-ownership exit, not a plain absence", store.probe)
 	}
-	if _, probe := hookClaimHeadRepoDir(f.subdir); probe != hookClaimProbeAbsent {
+	if _, probe := hookClaimHeadRepoDir(f.subdir); probe != hookClaimProbeDeclined {
 		t.Fatalf("the subdirectory probe is %v; git has to refuse it the same way", probe)
 	}
 
@@ -1025,11 +1034,8 @@ func TestHookClaimRefusesTheStoreWhenGitDeclinesToAnswer(t *testing.T) {
 	// candidate is still admitted.
 	bare := t.TempDir()
 	plain := hookClaimResolveStoreHead(bare)
-	if plain.probe == hookClaimProbeAnswered {
-		t.Fatalf("the no-repository store probe is %v; this half needs a directory git finds nothing in", plain.probe)
-	}
-	if hookClaimDirLooksLikeRepo(bare) {
-		t.Fatalf("%s carries a repository on disk; the two readings are not separated", bare)
+	if plain.probe != hookClaimProbeAbsent {
+		t.Fatalf("the no-repository store probe is %v, want %v; this half needs a directory git finds nothing in", plain.probe, hookClaimProbeAbsent)
 	}
 	usable := filepath.Join(bare, "..", "usable-checkout")
 	if err := os.MkdirAll(filepath.Clean(usable), 0o755); err != nil {
@@ -1124,11 +1130,8 @@ func TestHookClaimRefusesTheCandidatesItCannotCompare(t *testing.T) {
 	t.Setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
 
 	store := hookClaimResolveStoreHead(f.store)
-	if store.probe != hookClaimProbeAbsent {
-		t.Fatalf("the store probe is %v; this case needs git to refuse it with an exit status", store.probe)
-	}
-	if !hookClaimDirLooksLikeRepo(f.store) {
-		t.Fatalf("%s does not carry a repository on disk; the refusal would be about the wrong thing", f.store)
+	if store.probe != hookClaimProbeDeclined {
+		t.Fatalf("the store probe is %v; this case needs git to refuse it for dubious ownership", store.probe)
 	}
 
 	rel, err := filepath.Rel(f.root, f.subdir)
@@ -1185,5 +1188,63 @@ func TestHookClaimPinnedBranchReadKeepsRelativeConfigSemantics(t *testing.T) {
 	tree := hookClaimTreeFor(t, f.worker)
 	if got := hookResolveWorkBranch(tree); got != hookClaimFixtureWorkerBranch {
 		t.Errorf("branch = %q, want %q; the pinned read resolved its relative config against the process directory", got, hookClaimFixtureWorkerBranch)
+	}
+}
+
+// TestHookClaimRefusesAdministrativeWorktreeDirOfDecliningStore pins the third of the
+// three misses recorded against the earlier stat-based hookClaimDirLooksLikeRepo: a
+// linked worktree's administrative directory under the store's own .git/worktrees/
+// carries HEAD and commondir but no objects/ of its own, so a marker check requiring
+// an "objects" subdirectory never recognized it as a repository. Asking git directly
+// -- what this fix replaces the marker check with -- recognizes it because git does,
+// regardless of what files happen to sit beside it.
+func TestHookClaimRefusesAdministrativeWorktreeDirOfDecliningStore(t *testing.T) {
+	f := newHookClaimStoreFixture(t)
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+
+	store := hookClaimResolveStoreHead(f.store)
+	if store.probe != hookClaimProbeDeclined {
+		t.Fatalf("the store probe is %v; this case needs git to refuse it for dubious ownership", store.probe)
+	}
+
+	admin := filepath.Join(f.gitDir, "worktrees", filepath.Base(f.linked))
+	if info, err := os.Stat(admin); err != nil || !info.IsDir() {
+		t.Fatalf("the linked worktree's administrative directory %s does not exist: %v", admin, err)
+	}
+
+	if _, admitted := store.Admit(admin); admitted {
+		t.Errorf("admitted %s, the linked worktree's own administrative directory inside the declining store's .git, as evidence of this bead's work", admin)
+	}
+}
+
+// TestHookClaimPathOutsideDoesNotMixResolvedAndUnresolvedBases pins the third
+// recorded defect: when the child's own symlink resolution fails while the parent's
+// succeeds, the old code compared the parent's REAL target against the child's
+// merely-cleaned, unresolved spelling. Those are different coordinate systems, so a
+// child that genuinely sits inside the parent could compare as unrelated ("outside")
+// purely because of which side happened to resolve. The fix falls back to the cleaned
+// spelling on BOTH sides whenever either one fails, so the comparison is always
+// apples to apples.
+func TestHookClaimPathOutsideDoesNotMixResolvedAndUnresolvedBases(t *testing.T) {
+	root := t.TempDir()
+	realStore := filepath.Join(root, "real-store")
+	if err := os.MkdirAll(realStore, 0o755); err != nil {
+		t.Fatalf("creating %s: %v", realStore, err)
+	}
+	parent := filepath.Join(root, "store-alias")
+	if err := os.Symlink(realStore, parent); err != nil {
+		t.Skipf("this filesystem does not support symlinks: %v", err)
+	}
+	// child names a real descendant of the ALIAS (not of the resolved target), so
+	// EvalSymlinks(child) resolves through the alias to a path under "real-store"
+	// that does not itself exist as a distinct filesystem entry to stat -- forcing
+	// its own resolution to fail -- while EvalSymlinks(parent) succeeds and reaches
+	// "real-store" directly. Both named through the alias, so if the fallback did not
+	// apply to both sides the two would land in different coordinate systems.
+	child := filepath.Join(parent, "missing-leaf", "nested")
+	if hookClaimPathOutside(child, parent) {
+		t.Errorf("hookClaimPathOutside(%q, %q) = true; a descendant of the parent read as outside because only one side's symlink resolution failed", child, parent)
 	}
 }

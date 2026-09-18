@@ -1606,9 +1606,24 @@ type hookClaimProbe int
 const (
 	// hookClaimProbeAnswered means git ran and returned a value.
 	hookClaimProbeAnswered hookClaimProbe = iota
-	// hookClaimProbeAbsent means git ran and reported there is nothing here, which
-	// for repository discovery means no repository covers the directory.
+	// hookClaimProbeAbsent means git ran, exited nonzero, and said in so many words
+	// that no repository covers the directory ("not a git repository (or any of the
+	// parent directories)"). That message is git having actually looked and found
+	// nothing, at any ancestor depth, so it is the only exit that means "no
+	// repository here" for repository discovery.
 	hookClaimProbeAbsent
+	// hookClaimProbeDeclined means git ran, exited nonzero, and said something other
+	// than "not a git repository" -- dubious ownership, an unreadable config, a
+	// permission error. Those all mean a repository IS there and git refused to
+	// answer about it, which is a different fact than there being no repository at
+	// all, even though both share the same exit status. Treating this the same as
+	// hookClaimProbeAbsent is exactly the "unknown repository identity read as
+	// admission" defect: it fails open for every directory a stat-based marker check
+	// cannot see (a marker it lacks permission to read, a repository found by
+	// ascending past the directory itself, a linked worktree's administrative
+	// directory), because each of those is still a repository, and git already knows
+	// it while a stat of the directory does not.
+	hookClaimProbeDeclined
 	// hookClaimProbeUnavailable means the query did not complete, so nothing was
 	// learned either way.
 	hookClaimProbeUnavailable
@@ -1701,41 +1716,31 @@ func (s hookClaimStoreHead) Admit(candidate string) (hookClaimWorkTree, bool) {
 	candRepo, candProbe := hookClaimHeadRepoDir(cand)
 	switch candProbe {
 	case hookClaimProbeAbsent:
-		// git ran and reported that no repository covers this candidate. Usually
-		// there is nothing to exclude, because the branch read is the same discovery
-		// and will find none either.
-		//
-		// Usually, not always: git declines some questions with the same exit status
-		// it uses for "no repository here". A shared checkout owned by another user
-		// is refused for dubious ownership, an unreadable config is fatal, and in
-		// both cases the store IS a repository that the claiming session simply
-		// cannot ask about. Refusing a candidate that lies inside the store's own
-		// directory covers that, and it is the one comparison that needs no
-		// cooperation from git. It is a refusal only: a directory that answers for
-		// itself never reaches here, so a nested independent checkout and a linked
-		// worktree keep their own identity.
-		//
-		// Both halves of that refusal have to be positive, because this arm ADMITS on
-		// its own judgement and a stamp it hands out is never checked again. A store
-		// whose own repository was never identified clears nothing: there is no
-		// identity to compare against, and a candidate reached from outside the store
-		// directory can still name the store's repository through a .git file or an
-		// administrative directory, which no comparison of paths can see. And
-		// containment has to be SHOWN, not merely not-disproved, so every name this
-		// cannot decide is refused rather than stamped.
-		if s.probe != hookClaimProbeAnswered && hookClaimDirLooksLikeRepo(s.dir) {
+		// git ran and reported, in so many words, that no repository covers this
+		// candidate. There is nothing to exclude, because the branch read is the same
+		// discovery and will find none either -- UNLESS the store's own repository
+		// declined to identify itself (hookClaimProbeDeclined): a shared checkout
+		// owned by another user is refused for dubious ownership, an unreadable
+		// config is fatal, and in both cases the store IS a repository that the
+		// claiming session simply cannot ask about. Refusing every candidate while
+		// the store is in that state covers it, and it needs no cooperation from git
+		// beyond the one probe already run to resolve the store: a directory that
+		// answers for itself never reaches this arm, so a nested independent
+		// checkout and a linked worktree keep their own identity regardless.
+		if s.probe == hookClaimProbeDeclined {
 			return hookClaimWorkTree{}, false
 		}
 		if !hookClaimPathOutside(cand, s.dir) {
 			return hookClaimWorkTree{}, false
 		}
 		return hookClaimWorkTree{Dir: cand}, true
-	case hookClaimProbeUnavailable:
-		// The question could not be asked, so which repository answers for this
-		// candidate is unknown while a later branch read may still succeed. Refuse
-		// it. The premise of this change is that the store's branch is worse than no
-		// branch, and that ordering has to hold when the answer is unknown, not only
-		// when it is known.
+	case hookClaimProbeDeclined, hookClaimProbeUnavailable:
+		// Either the question could not be asked, or git asked it and refused to
+		// answer about the candidate itself. Both leave which repository answers for
+		// this candidate unknown while a later branch read may still succeed, so
+		// refuse it. The premise of this change is that the store's branch is worse
+		// than no branch, and that ordering has to hold when the answer is unknown,
+		// not only when it is known.
 		return hookClaimWorkTree{}, false
 	}
 	if s.probe != hookClaimProbeAnswered {
@@ -1752,38 +1757,16 @@ func (s hookClaimStoreHead) Admit(candidate string) (hookClaimWorkTree, bool) {
 	return hookClaimWorkTree{Dir: cand, RepoDir: candRepo}, true
 }
 
-// hookClaimDirLooksLikeRepo reports whether dir carries a repository on disk, asked
-// without git. It separates the two readings that share one exit status: a directory
-// that holds no repository at all, and a repository git declined to answer for.
-//
-// Only the second one is dangerous. When the store holds a repository that refused to
-// identify itself -- another user owns it, or its config is unreadable -- then every
-// candidate reaching that same repository refuses identically, whether it sits inside
-// the store directory or outside it behind a .git file or an administrative path, and
-// no comparison of paths separates them. Nothing can be cleared in that state. When
-// the store holds no repository, there is no branch to leak and the path comparison
-// is the whole question.
-//
-// A worktree carries .git as a directory or as a file; a bare repository carries HEAD
-// beside objects/.
-func hookClaimDirLooksLikeRepo(dir string) bool {
-	if strings.TrimSpace(dir) == "" {
-		return false
-	}
-	if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
-		return true
-	}
-	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err != nil {
-		return false
-	}
-	info, err := os.Stat(filepath.Join(dir, "objects"))
-	return err == nil && info.IsDir()
-}
-
 // hookClaimPathOutside reports whether child can be SHOWN to name a directory that
 // is neither parent nor inside it. Symlinks are resolved on both sides so an aliased
-// spelling is compared as the directory it reaches; when a name cannot be resolved --
-// a recorded path that no longer exists -- the cleaned names are compared instead.
+// spelling is compared as the directory it reaches; when EITHER name cannot be
+// resolved -- a recorded path that no longer exists, or one this process cannot stat
+// -- the cleaned names are compared for BOTH sides instead, never one resolved and
+// the other merely cleaned. Comparing a resolved path against a cleaned one compares
+// two different coordinate systems: a descendant of the store whose own symlink
+// resolution happens to fail would resolve the store's side to its real target while
+// its own side stayed an unresolved, differently-rooted spelling, and the two would
+// compare as unrelated -- admitting a path that is actually inside the store.
 //
 // Every reading it cannot establish is false, because the caller admits on true. A
 // relative name is refused because it means nothing without the process directory it
@@ -1798,13 +1781,11 @@ func hookClaimPathOutside(child, parent string) bool {
 	if hookClaimPathFoldsDotDot(child) || hookClaimPathFoldsDotDot(parent) {
 		return false
 	}
-	resolve := func(path string) string {
-		if resolved, err := filepath.EvalSymlinks(path); err == nil {
-			return resolved
-		}
-		return filepath.Clean(path)
+	childPath, childErr := filepath.EvalSymlinks(child)
+	parentPath, parentErr := filepath.EvalSymlinks(parent)
+	if childErr != nil || parentErr != nil {
+		childPath, parentPath = filepath.Clean(child), filepath.Clean(parent)
 	}
-	childPath, parentPath := resolve(child), resolve(parent)
 	if childPath == parentPath {
 		return false
 	}
@@ -1879,13 +1860,24 @@ func hookClaimRunGitArgs(args []string) (string, hookClaimProbe) {
 // hookClaimClassifyGitOutput decides what one git query actually established, from
 // the deadline state, the run error, and the output.
 //
-// A nonzero EXIT from a git that ran IS an answer for the queries here: "not a git
-// repository" and "cannot change to <dir>" both mean no repository covers the
-// directory. Exiting is the part that makes it an answer, so the status has to be a
-// real exit status: a process killed by a signal also surfaces as an ExitError while
-// having established nothing, and so does one the context killed, which is why the
-// deadline is checked first and on its own. Anything else, a git that could not be
-// started or output that cannot be used, established nothing either.
+// A nonzero EXIT from a git that ran IS an answer for the queries here, but "no
+// repository covers this directory" and "a repository is here and I refuse to say so"
+// share that one exit status, and only git's own stderr text tells them apart. Two
+// messages mean no repository covers the directory: "fatal: not a git repository (or
+// any of the parent directories)" is git having actually looked, at any ancestor
+// depth, and found nothing, and "fatal: cannot change to '<dir>'" means the directory
+// itself could not even be entered (removed, never created), which forecloses a
+// repository being found there just as completely. Both read as hookClaimProbeAbsent.
+// Everything else a failing git says -- dubious ownership, an unreadable config --
+// reads as hookClaimProbeDeclined: unknown rather than absent, because guessing wrong
+// the other way is what let a declining repository's own subdirectories, or a linked
+// worktree's administrative directory that a stat-based marker check cannot see, read
+// as "no repository here" and get admitted. Exiting is the part that makes any of
+// this an answer at all, so the status has to be a real exit status: a process killed
+// by a signal also surfaces as an ExitError while having established nothing, and so
+// does one the context killed, which is why the deadline is checked first and on its
+// own. Anything else, a git that could not be started or output that cannot be used,
+// established nothing either.
 func hookClaimClassifyGitOutput(ctxErr, runErr error, out string) (string, hookClaimProbe) {
 	if ctxErr != nil {
 		return "", hookClaimProbeUnavailable
@@ -1893,7 +1885,11 @@ func hookClaimClassifyGitOutput(ctxErr, runErr error, out string) (string, hookC
 	if runErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(runErr, &exitErr) && exitErr.Exited() {
-			return "", hookClaimProbeAbsent
+			stderr := string(exitErr.Stderr)
+			if strings.Contains(stderr, "not a git repository") || strings.Contains(stderr, "cannot change to") {
+				return "", hookClaimProbeAbsent
+			}
+			return "", hookClaimProbeDeclined
 		}
 		return "", hookClaimProbeUnavailable
 	}
