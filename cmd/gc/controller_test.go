@@ -187,7 +187,7 @@ func TestControllerShutdown(t *testing.T) {
 	// Ensure cleanup: if the test fails, send stop so the goroutine exits.
 	t.Cleanup(func() {
 		tryStopController(dir, &bytes.Buffer{})
-		awaitClose(t, done, "controller to exit after stop")
+		awaitControllerShutdownClose(t, done, "controller to exit after stop")
 	})
 
 	// Poll for controller socket to become available instead of fixed sleep.
@@ -197,7 +197,7 @@ func TestControllerShutdown(t *testing.T) {
 		t.Fatal("tryStopController returned false, expected true")
 	}
 
-	awaitClose(t, done, "runController exit after stop")
+	awaitControllerShutdownClose(t, done, "runController exit after stop")
 	if exitCode != 0 {
 		t.Errorf("runController exit code = %d, want 0; stderr: %s", exitCode, stderr.String())
 	}
@@ -205,6 +205,40 @@ func TestControllerShutdown(t *testing.T) {
 	// Agent should have been stopped during shutdown.
 	if sp.IsRunning("mayor") {
 		t.Error("agent should be stopped after controller shutdown")
+	}
+}
+
+// controllerShutdownAwaitBudget is a wider, test-local override of the
+// package's shared hangBudget (60s), used only by TestControllerShutdown's
+// two waits on runController's exit channel.
+//
+// gc-25gdhh measured this test's shutdown path itself as fully bounded: with
+// Daemon.ShutdownTimeout="0s" in this test's config, gracefulStopAllWithForceSignal
+// takes the immediate-kill branch (no poll loop), and cr.shutdown()'s only other
+// waits (waitForAsyncStarts / waitForAsyncStops) are each capped at 5s. Nothing
+// on this path is unbounded or purely poll-driven, so there is no shutdown-code
+// bug to fix here. What blew the 60s hangBudget in production
+// (controller_test.go:200, 326.12s) was host contention: three worker lanes at
+// load ~95 on 16 cores, competing for the same OS threads and for fork/exec
+// slots the bead store's `bd` subprocess calls need. The same tree run quiet
+// passed 8/8 at 0.12-0.18s (a ~400x margin), so the code is correct; only the
+// budget was wrong for that stress regime. hangBudget's own doc comment
+// derives its 6x multiplier from single-core CPU-starvation measurements
+// (ga-h51wa1, 18.0-19.8s worst observed) — a different, milder stressor than
+// full-host multi-process contention across concurrent test lanes, where the
+// controller's shutdown goroutine can wait much longer just to be scheduled
+// onto a P. Raised only for this test's two waits, not the shared hangBudget
+// used by every other test in the package.
+const controllerShutdownAwaitBudget = 5 * time.Minute
+
+// awaitControllerShutdownClose is awaitClose with controllerShutdownAwaitBudget
+// in place of the package-wide hangBudget. See controllerShutdownAwaitBudget.
+func awaitControllerShutdownClose(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(controllerShutdownAwaitBudget):
+		t.Fatalf("%s did not complete within the hang budget (%s)", what, controllerShutdownAwaitBudget)
 	}
 }
 
