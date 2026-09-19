@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -447,6 +448,57 @@ func TestCmdBeadsShow_MissingID_DoesNotProbeAPIClient(t *testing.T) {
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+}
+
+// TestBeadsShowCmd_WithoutExecutionFlagIsByteIdenticalToPlainShow pins that
+// wiring the --execution flag onto `gc beads show` (gc-1dm86y, porting
+// cmd_beads_execution.go) did not change the default (no-flag) path at all:
+// newBeadsShowCmd's RunE must still dispatch to cmdBeadsShow, not
+// cmdBeadsShowExecution, when --execution is left at its false default. It
+// drives the real cobra command (not cmdBeadsShow directly) so a regression
+// in the run-selector itself, not just in cmdBeadsShow, would be caught.
+func TestBeadsShowCmd_WithoutExecutionFlagIsByteIdenticalToPlainShow(t *testing.T) {
+	clearGCEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	writeCityToml(t, cityDir, "[workspace]\nname = \"beads-show-execution-flag\"\n")
+
+	store, code := openCityStore(io.Discard, "test-setup")
+	if store == nil || code != 0 {
+		t.Fatalf("openCityStore failed: code=%d", code)
+	}
+	b, err := store.Create(beads.Bead{Title: "plain show parity fixture", Type: "task"})
+	if err != nil {
+		t.Fatalf("seeding bead: %v", err)
+	}
+
+	prev := beadsShowAPIClient
+	t.Cleanup(func() { beadsShowAPIClient = prev })
+	beadsShowAPIClient = func(string) (*api.Client, string) { return nil, "no controller for this fixture city" }
+
+	for _, format := range []string{"text", "json"} {
+		t.Run(format, func(t *testing.T) {
+			var direct bytes.Buffer
+			var directErr bytes.Buffer
+			if code := cmdBeadsShow(b.ID, format, &direct, &directErr); code != 0 {
+				t.Fatalf("direct cmdBeadsShow exit = %d, stderr=%q", code, directErr.String())
+			}
+
+			var viaCmd bytes.Buffer
+			var viaCmdErr bytes.Buffer
+			cmd := newBeadsShowCmd(&viaCmd, &viaCmdErr)
+			cmd.SetArgs([]string{b.ID, "--format=" + format})
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("cobra command execute: %v; stderr=%q", err, viaCmdErr.String())
+			}
+
+			if viaCmd.String() != direct.String() {
+				t.Fatalf("gc beads show %s (no --execution) diverged from direct cmdBeadsShow:\nvia cobra: %q\ndirect:    %q",
+					format, viaCmd.String(), direct.String())
+			}
+		})
 	}
 }
 
