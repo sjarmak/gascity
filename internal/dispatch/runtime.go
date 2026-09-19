@@ -1796,15 +1796,42 @@ func resolveFinalizeOutcome(store beads.Store, finalizer beads.Bead) (string, er
 	}
 	rootID := strings.TrimSpace(finalizer.Metadata[beadmeta.RootBeadIDMetadataKey])
 	if outcome == beadmeta.OutcomePass && rootID != "" {
-		_, failed, err := terminalAbortScopeFailureMember(store, rootID, finalizer.ID)
+		member, failed, err := terminalAbortScopeFailureMember(store, rootID, finalizer.ID)
 		if err != nil {
 			return "", err
 		}
-		if failed {
+		if failed && !abortScopeFailureTargetAlreadyDelivered(store, member) {
 			outcome = beadmeta.OutcomeFail
 		}
 	}
 	return outcome, nil
+}
+
+// abortScopeFailureTargetAlreadyDelivered reports whether member's target
+// bead (the work item named by its gc.var.issue formula variable) is already
+// closed with a recorded producer disposition of deliverable. A member in
+// this state is the ladder tripping over its own success — most often a
+// workspace-setup step that reran after the root's own worker already closed
+// the target, found it done, and correctly refused as duplicate_dispatch
+// (gc-le45hl) — not a real failure of the scope, so it must not demote the
+// root's outcome.
+//
+// This checks ONLY the recorded disposition, never target status alone, the
+// member's own failure class/reason, or any inference from timing: a target
+// that is merely closed (non-deliverable, or with no disposition recorded at
+// all) still demotes normally, which is what keeps a genuine scope failure
+// (gc-3myte3: work landed on the wrong branch, target still open) failing.
+func abortScopeFailureTargetAlreadyDelivered(store beads.Store, member beads.Bead) bool {
+	targetID := strings.TrimSpace(member.Metadata[beadmeta.FormulaVarPrefix+"issue"])
+	if targetID == "" {
+		return false
+	}
+	target, err := store.Get(targetID)
+	if err != nil {
+		return false
+	}
+	return target.Status == "closed" &&
+		strings.TrimSpace(target.Metadata[beadmeta.CoordinatorOutcomeProducerDispositionMetadataKey]) == beadmeta.CoordinatorDispositionDeliverable
 }
 
 // resolveFinalizeFailureDiagnostics returns the failure metadata to stamp on
