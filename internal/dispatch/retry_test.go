@@ -319,7 +319,7 @@ func TestClassifyRetryAttemptRetriesInvalidRequiredOutputJSON(t *testing.T) {
 			"gc.output_json_required": "true",
 			"gc.output_json":          "/tmp/gc.output_json.pretty.json",
 		},
-	})
+	}, ProcessOptions{})
 	want := retryEvalResult{Outcome: "transient", Reason: "invalid_required_output_json"}
 	if got != want {
 		t.Fatalf("classifyRetryAttempt() = %+v, want %+v", got, want)
@@ -335,7 +335,7 @@ func TestClassifyRetryAttemptCanceledIsTerminalNonRetry(t *testing.T) {
 
 	got := classifyRetryAttempt(beads.Bead{
 		Metadata: map[string]string{"gc.outcome": "canceled"},
-	})
+	}, ProcessOptions{})
 	want := retryEvalResult{Outcome: "canceled"}
 	if got != want {
 		t.Fatalf("classifyRetryAttempt(canceled) = %+v, want %+v", got, want)
@@ -501,12 +501,85 @@ func TestClassifyRetryAttemptConsumesTypedCoordinatorOutcome(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := classifyRetryAttempt(beads.Bead{ID: attemptID, Metadata: tt.metadata})
+			got := classifyRetryAttempt(beads.Bead{ID: attemptID, Metadata: tt.metadata}, ProcessOptions{})
 			if got != tt.want {
 				t.Fatalf("classifyRetryAttempt() = %+v, want %+v", got, tt.want)
 			}
 		})
 	}
+}
+
+// TestCoordinatorReasonHasEvidenceShape pins the structural (shape-only, no
+// keyword/phrase list) evidence check gc-tqfwzy adds: a reason token counts
+// only if it has the mechanical shape of a git object name, a ref-shaped
+// path, or a Go test identifier.
+func TestCoordinatorReasonHasEvidenceShape(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		reason string
+		want   bool
+	}{
+		{name: "recorded junk placeholder has no evidence shape", reason: "test-probe-ignore", want: false},
+		{name: "empty reason has no evidence shape", reason: "", want: false},
+		{name: "plain prose with no shaped token has no evidence shape", reason: "looks fine to me", want: false},
+		{name: "reason naming a commit sha", reason: "landed as 56ebefe91 on main", want: true},
+		{name: "reason naming a branch", reason: "pushed to work/gc-tqfwzy for review", want: true},
+		{name: "reason naming a go test identifier", reason: "TestClassifyRetryAttemptConsumesTypedCoordinatorOutcome now covers it", want: true},
+		{name: "bare decimal number is not mistaken for a commit sha", reason: "closed after 1234567 seconds", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := coordinatorReasonHasEvidenceShape(tt.reason); got != tt.want {
+				t.Fatalf("coordinatorReasonHasEvidenceShape(%q) = %v, want %v", tt.reason, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestClassifyRetryAttemptWeakCoordinatorReasonEnforcement pins gc-tqfwzy's
+// WARN-vs-REJECT behavior for a deliverable envelope whose reason fails the
+// structural evidence check: promoted to pass with enforcement off (today's
+// behavior, unchanged, surfaced only via trace), demoted to missing_outcome
+// (the existing outcome-less path, not a new outcome string) with enforcement
+// on.
+func TestClassifyRetryAttemptWeakCoordinatorReasonEnforcement(t *testing.T) {
+	weakDeliverable := map[string]string{
+		"gc.coordinator_outcome.producer_disposition": `{"contract_version":1,"disposition":"deliverable","work_id":"gc-attempt1","recorded_by":"tester","reason":"test-probe-ignore","producer":"formula-step"}`,
+	}
+
+	t.Run("enforcement off still promotes to pass", func(t *testing.T) {
+		t.Setenv(coordinatorReasonEnforceEnvVar, "")
+		got := classifyRetryAttempt(beads.Bead{ID: "gc-attempt1", Metadata: weakDeliverable}, ProcessOptions{})
+		want := retryEvalResult{Outcome: "pass"}
+		if got != want {
+			t.Fatalf("classifyRetryAttempt() = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("enforcement on blocks promotion", func(t *testing.T) {
+		t.Setenv(coordinatorReasonEnforceEnvVar, "true")
+		got := classifyRetryAttempt(beads.Bead{ID: "gc-attempt1", Metadata: weakDeliverable}, ProcessOptions{})
+		want := retryEvalResult{Outcome: "transient", Reason: "missing_outcome"}
+		if got != want {
+			t.Fatalf("classifyRetryAttempt() = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("enforcement on still promotes an evidentiary reason", func(t *testing.T) {
+		t.Setenv(coordinatorReasonEnforceEnvVar, "true")
+		strongDeliverable := map[string]string{
+			"gc.coordinator_outcome.producer_disposition": `{"contract_version":1,"disposition":"deliverable","work_id":"gc-attempt1","recorded_by":"tester","reason":"shipped 56ebefe91 on work/gc-tqfwzy","producer":"formula-step"}`,
+		}
+		got := classifyRetryAttempt(beads.Bead{ID: "gc-attempt1", Metadata: strongDeliverable}, ProcessOptions{})
+		want := retryEvalResult{Outcome: "pass"}
+		if got != want {
+			t.Fatalf("classifyRetryAttempt() = %+v, want %+v", got, want)
+		}
+	})
 }
 
 func TestClassifyRetryAttemptWithPostconditionsRequiresArtifact(t *testing.T) {

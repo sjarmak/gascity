@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -413,10 +414,120 @@ func typedDeliverableCloseFor(subject beads.Bead) bool {
 	return true
 }
 
-func classifyRetryAttempt(subject beads.Bead) retryEvalResult {
+// coordinatorReasonEnforceEnvVar gates whether a coordinator_outcome.producer_
+// disposition envelope whose reason carries no structural evidence blocks
+// retry-eval promotion (enforce) or only surfaces a trace warning while still
+// promoting (warn-only, the default). This follows the same shape as
+// cmd/gc/work_record_gate.go's ADR-0009 close gate: ship warn-only so existing
+// closes migrate without breakage, and let an operator flip enforcement on
+// once the population of weak reasons is understood.
+const coordinatorReasonEnforceEnvVar = "GC_COORDINATOR_REASON_ENFORCE"
+
+// coordinatorReasonEnforceEnabled reports whether classifyRetryAttempt should
+// block promotion for a reason that fails the structural evidence check,
+// rather than only warning.
+func coordinatorReasonEnforceEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(coordinatorReasonEnforceEnvVar))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// coordinatorReasonRefShapePattern matches a token shaped like a git ref or
+// worktree-relative path: alphanumerics/`.`/`_`/`-` segments joined by at
+// least one `/`. It says nothing about what the ref names — only that the
+// token has the ref grammar's shape.
+var coordinatorReasonRefShapePattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*/[A-Za-z0-9._-]+)+$`)
+
+// coordinatorReasonGoTestPattern matches a token shaped like a Go test
+// identifier (the `TestXxx` convention `go test` itself requires to select a
+// test), not any word that happens to contain "test".
+var coordinatorReasonGoTestPattern = regexp.MustCompile(`^Test[A-Za-z0-9_]+$`)
+
+// coordinatorReasonIsHexObjectToken reports whether token has the shape of a
+// git object name: 7-40 hexadecimal characters. A run of plain decimal digits
+// is deliberately excluded (it requires at least one a-f letter) so an
+// ordinary number in a reason is not mistaken for a commit SHA; a real
+// abbreviated or full object ID overwhelmingly contains one within a few
+// characters.
+func coordinatorReasonIsHexObjectToken(token string) bool {
+	if len(token) < 7 || len(token) > 40 {
+		return false
+	}
+	hasHexLetter := false
+	for _, r := range token {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f', r >= 'A' && r <= 'F':
+			hasHexLetter = true
+		default:
+			return false
+		}
+	}
+	return hasHexLetter
+}
+
+// coordinatorReasonHasEvidenceShape reports whether reason contains at least
+// one token whose SHAPE is mechanically checkable evidence of delivered work —
+// a git-object-length hex string, a ref-shaped path, or a Go test identifier —
+// rather than judging whether the prose reads as convincing. This repository
+// bans keyword/regex meaning-detection and hardcoded-phrasing lists in
+// orchestration code; a shape test is neither; a token either has one of these
+// three mechanical shapes or it doesn't, and no list of acceptable words is
+// enumerated anywhere in this function.
+func coordinatorReasonHasEvidenceShape(reason string) bool {
+	tokens := strings.FieldsFunc(reason, func(r rune) bool {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return false
+		case r == '-' || r == '_' || r == '.' || r == '/':
+			return false
+		default:
+			return true
+		}
+	})
+	for _, token := range tokens {
+		if coordinatorReasonIsHexObjectToken(token) ||
+			coordinatorReasonRefShapePattern.MatchString(token) ||
+			coordinatorReasonGoTestPattern.MatchString(token) {
+			return true
+		}
+	}
+	return false
+}
+
+// coordinatorDispositionReason extracts the Reason field from subject's typed
+// coordinator_outcome.producer_disposition envelope. Callers must already have
+// confirmed typedDeliverableCloseFor(subject); this performs its own decode
+// rather than threading state out of that validator, so the six-check
+// validator's signature and return value stay exactly as they were before this
+// reason-shape check existed.
+func coordinatorDispositionReason(subject beads.Bead) string {
+	raw := strings.TrimSpace(subject.Metadata[beadmeta.CoordinatorOutcomeProducerDispositionMetadataKey])
+	var envelope struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		return ""
+	}
+	return envelope.Reason
+}
+
+func classifyRetryAttempt(subject beads.Bead, opts ProcessOptions) retryEvalResult {
 	outcome := strings.TrimSpace(subject.Metadata[beadmeta.OutcomeMetadataKey])
 	if outcome == "" && typedDeliverableCloseFor(subject) {
-		outcome = beadmeta.OutcomePass
+		reason := coordinatorDispositionReason(subject)
+		switch {
+		case coordinatorReasonHasEvidenceShape(reason):
+			outcome = beadmeta.OutcomePass
+		case coordinatorReasonEnforceEnabled():
+			opts.tracef("retry-eval subject=%s result=blocked reason=weak_coordinator_reason enforce=true", subject.ID)
+		default:
+			opts.tracef("retry-eval subject=%s result=surfaced reason=weak_coordinator_reason enforce=false", subject.ID)
+			outcome = beadmeta.OutcomePass
+		}
 	}
 	switch outcome {
 	case beadmeta.OutcomePass:
@@ -454,7 +565,7 @@ func classifyRetryAttempt(subject beads.Bead) retryEvalResult {
 }
 
 func classifyRetryAttemptWithPostconditions(store beads.Store, subject beads.Bead, opts ProcessOptions) (retryEvalResult, error) {
-	result := classifyRetryAttempt(subject)
+	result := classifyRetryAttempt(subject, opts)
 	if result.Outcome != "pass" {
 		return result, nil
 	}
