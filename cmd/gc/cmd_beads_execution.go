@@ -47,7 +47,7 @@ func cmdBeadsShowExecution(id, format string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	views, code := openAllConvoyStoresAt(cityPath, stderr, "gc beads show --execution")
+	views, code := openAllConvoyStoresAt(cityPath, stderr, "gc beads show --execution") // residency:allow — same read-only multi-store enumeration as the sibling cmdBeadsShow/doBeadsListFallback fallbacks; a workflow root can live in a different store than its source work bead, so this correlation genuinely needs every store, not one resolved owner
 	if views == nil {
 		return code
 	}

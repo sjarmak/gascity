@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -84,32 +83,17 @@ func TestCmdBeadsShowExecution_ResolveErrorTakesPrecedenceOverMissingID(t *testi
 	}
 }
 
-func execTestGit(t *testing.T, dir string, args ...string) {
-	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	// Strip inherited git env so the temp repo is not confused with a parent.
-	for _, e := range os.Environ() {
-		k, _, _ := strings.Cut(e, "=")
-		switch k {
-		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_CONFIG":
-			continue
-		}
-		cmd.Env = append(cmd.Env, e)
-	}
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %s: %s: %v", strings.Join(args, " "), out, err)
-	}
-}
-
+// execTestRepoOnBranch builds a throwaway git repo via the package's existing
+// runGitInTest helper (cmd_rig_test.go) rather than a new exec.Command call
+// site, per the resource census's untagged-subprocess ratchet.
 func execTestRepoOnBranch(t *testing.T, branch string) string {
 	t.Helper()
 	dir := t.TempDir()
-	execTestGit(t, dir, "init")
-	execTestGit(t, dir, "config", "user.email", "t@t.com")
-	execTestGit(t, dir, "config", "user.name", "T")
-	execTestGit(t, dir, "checkout", "-b", branch)
-	execTestGit(t, dir, "commit", "--allow-empty", "-m", "base")
+	runGitInTest(t, dir, "init")
+	runGitInTest(t, dir, "config", "user.email", "t@t.com")
+	runGitInTest(t, dir, "config", "user.name", "T")
+	runGitInTest(t, dir, "checkout", "-b", branch)
+	runGitInTest(t, dir, "commit", "--allow-empty", "-m", "base")
 	return dir
 }
 
@@ -134,9 +118,9 @@ func TestGitWorktreeProbe_AheadAndReachability(t *testing.T) {
 	// base, commits_ahead=2. The base is resolved from the repo default branch
 	// (here "master"), NOT a hardcoded origin/main.
 	repo := execTestRepoOnBranch(t, "master")
-	execTestGit(t, repo, "checkout", "-b", "feature")
-	execTestGit(t, repo, "commit", "--allow-empty", "-m", "f1")
-	execTestGit(t, repo, "commit", "--allow-empty", "-m", "f2")
+	runGitInTest(t, repo, "checkout", "-b", "feature")
+	runGitInTest(t, repo, "commit", "--allow-empty", "-m", "f1")
+	runGitInTest(t, repo, "commit", "--allow-empty", "-m", "f2")
 
 	var p gitWorktreeProbe
 	// Explicit base ref resolves; measure against it.
@@ -167,9 +151,9 @@ func TestGitWorktreeProbe_EmptyBaseRef_UsesDefaultBranchNotCurrentBranch(t *test
 	// branch. Measuring a feature branch against itself falsely reports the work
 	// as merged (ahead=0, reachable_from_main=true) — the core signal inverted.
 	repo := execTestRepoOnBranch(t, "main")
-	execTestGit(t, repo, "checkout", "-b", "feature")
-	execTestGit(t, repo, "commit", "--allow-empty", "-m", "f1")
-	execTestGit(t, repo, "commit", "--allow-empty", "-m", "f2")
+	runGitInTest(t, repo, "checkout", "-b", "feature")
+	runGitInTest(t, repo, "commit", "--allow-empty", "-m", "f1")
+	runGitInTest(t, repo, "commit", "--allow-empty", "-m", "f2")
 
 	var p gitWorktreeProbe
 	got := p.Probe(repo, "") // empty base -> must fall back to "main", not "feature"
