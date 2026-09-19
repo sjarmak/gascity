@@ -193,14 +193,56 @@ func ExplicitRig(st State, name string) (suspended, ok bool) {
 	return *r.Suspended, true
 }
 
+// Source identifies which of the three suspension-state inputs
+// produced an [Effective] result: a runtime override, the authored
+// city.toml startup default, or neither.
+type Source int
+
+const (
+	// SourceNone means neither a runtime override nor a startup
+	// default applies: the effective state is not suspended.
+	SourceNone Source = iota
+	// SourceRuntimeOverride means a runtime override recorded in the
+	// state file produced the effective value.
+	SourceRuntimeOverride
+	// SourceStartupDefault means the authored `suspended_on_start` in
+	// city.toml produced the effective value; no runtime override
+	// exists for this scope.
+	SourceStartupDefault
+)
+
+// RelPath is the suspension state file's canonical path relative to
+// the city root, for display in provenance messages.
+const RelPath = citylayout.RuntimeDataRoot + "/suspension-state.json"
+
+// Effective is the result of merging a runtime override with the
+// authored startup default, together with which input produced it.
+type Effective struct {
+	Suspended bool
+	Source    Source
+	// UpdatedAt is the state file's UpdatedAt timestamp. Only
+	// meaningful when Source == SourceRuntimeOverride.
+	UpdatedAt time.Time
+}
+
+// EffectiveRig computes the effective rig suspension result and its
+// provenance: a runtime override in st wins when present, otherwise
+// the authored suspendedOnStart default applies.
+func EffectiveRig(st State, name string, suspendedOnStart bool) Effective {
+	if v, ok := ExplicitRig(st, name); ok {
+		return Effective{Suspended: v, Source: SourceRuntimeOverride, UpdatedAt: st.UpdatedAt}
+	}
+	if suspendedOnStart {
+		return Effective{Suspended: true, Source: SourceStartupDefault}
+	}
+	return Effective{Suspended: false, Source: SourceNone}
+}
+
 // EffectiveRigSuspended computes the effective suspension state for
 // a rig by merging the runtime override with the rig's
 // SuspendedOnStart default. The runtime override wins when present.
 func EffectiveRigSuspended(st State, name string, suspendedOnStart bool) bool {
-	if v, ok := ExplicitRig(st, name); ok {
-		return v
-	}
-	return suspendedOnStart
+	return EffectiveRig(st, name, suspendedOnStart).Suspended
 }
 
 // SetRig records an explicit rig suspension preference on st. Pass

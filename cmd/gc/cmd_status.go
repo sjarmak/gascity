@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
@@ -116,7 +117,64 @@ type RigStatusRig struct {
 	Prefix        string `json:"prefix"`
 	DefaultBranch string `json:"default_branch,omitempty"`
 	Suspended     bool   `json:"suspended"`
-	Beads         string `json:"beads"`
+	// SuspendedSource names which suspension-state input produced
+	// Suspended: "runtime_override", "startup_default", or "none".
+	SuspendedSource string `json:"suspended_source"`
+	// SuspendedUpdatedAt is the runtime suspension-state file's
+	// updated_at timestamp. Only set when SuspendedSource is
+	// "runtime_override".
+	SuspendedUpdatedAt *time.Time `json:"suspended_updated_at,omitempty"`
+	Beads              string     `json:"beads"`
+}
+
+// rigStatusSuspension computes the rig's effective suspension state and
+// provenance for a "gc rig status" render, using the single existing
+// merge point (suspensionstate.EffectiveRig) rather than a parallel one.
+func rigStatusSuspension(cityPath string, rig config.Rig) suspensionstate.Effective {
+	suspState, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
+	return suspensionstate.EffectiveRig(suspState, rig.Name, rig.EffectiveSuspendedOnStart())
+}
+
+// suspendedUpdatedAtPtr returns eff.UpdatedAt as a pointer for JSON
+// rendering, or nil when eff was not produced by a runtime override.
+func suspendedUpdatedAtPtr(eff suspensionstate.Effective) *time.Time {
+	if eff.Source != suspensionstate.SourceRuntimeOverride {
+		return nil
+	}
+	t := eff.UpdatedAt
+	return &t
+}
+
+// suspendedSourceLabel renders a suspensionstate.Source as the
+// "suspended_source" JSON field / text-line label.
+func suspendedSourceLabel(src suspensionstate.Source) string {
+	switch src {
+	case suspensionstate.SourceRuntimeOverride:
+		return "runtime_override"
+	case suspensionstate.SourceStartupDefault:
+		return "startup_default"
+	default:
+		return "none"
+	}
+}
+
+// formatSuspendedLine renders the "Suspended:" line's value: the
+// existing yes/no token, followed by which of the three suspension-
+// state inputs produced it, so a reader can tell a real override from
+// a display artifact without opening a file (gc-7dbx0t).
+func formatSuspendedLine(eff suspensionstate.Effective) string {
+	token := "no"
+	if eff.Suspended {
+		token = "yes"
+	}
+	switch eff.Source {
+	case suspensionstate.SourceRuntimeOverride:
+		return fmt.Sprintf("%s (runtime override, %s, updated %s)", token, suspensionstate.RelPath, eff.UpdatedAt.Format(time.RFC3339))
+	case suspensionstate.SourceStartupDefault:
+		return fmt.Sprintf("%s (city.toml suspended_on_start)", token)
+	default:
+		return token
+	}
 }
 
 // RigStatusAgent describes an agent or concrete pool instance for a rig.
@@ -165,7 +223,7 @@ func routeRigStatus(
 		cr, err := c.GetStatus()
 		if err == nil {
 			logRoute(stderr, cmdName, "api", "")
-			return renderRigStatusFromAPI(cr, rig, dops, jsonOutput, stdout, stderr)
+			return renderRigStatusFromAPI(cr, rig, cityPath, dops, jsonOutput, stdout, stderr)
 		}
 		if !api.ShouldFallbackForRead(c, err) {
 			logRoute(stderr, cmdName, "api", "error")
@@ -185,18 +243,8 @@ func routeRigStatus(
 // agentStatusLineWithPartial, so this function only needs to emit header lines
 // ("<rig>:", "Path:", "Suspended:") and dispatch to agentStatusLineWithPartial
 // for each agent row.
-func renderRigStatusFromAPI(cr api.CachedRead[api.StatusView], rig config.Rig, dops drainOps, jsonOutput bool, stdout, stderr io.Writer) int {
-	suspStr := "no"
-	serverSuspended := rig.Suspended
-	for _, r := range cr.Body.Rigs {
-		if r.Name == rig.Name {
-			serverSuspended = r.Suspended
-			break
-		}
-	}
-	if serverSuspended {
-		suspStr = "yes"
-	}
+func renderRigStatusFromAPI(cr api.CachedRead[api.StatusView], rig config.Rig, cityPath string, dops drainOps, jsonOutput bool, stdout, stderr io.Writer) int {
+	eff := rigStatusSuspension(cityPath, rig)
 
 	if jsonOutput {
 		result := RigStatusJSON{
@@ -204,12 +252,14 @@ func renderRigStatusFromAPI(cr api.CachedRead[api.StatusView], rig config.Rig, d
 			CityPath:      cr.Body.CityPath,
 			CityName:      cr.Body.CityName,
 			Rig: RigStatusRig{
-				Name:          rig.Name,
-				Path:          rig.Path,
-				Prefix:        rig.EffectivePrefix(),
-				DefaultBranch: rig.EffectiveDefaultBranch(),
-				Suspended:     serverSuspended,
-				Beads:         rigBeadsStatus(fsys.OSFS{}, rig.Path),
+				Name:               rig.Name,
+				Path:               rig.Path,
+				Prefix:             rig.EffectivePrefix(),
+				DefaultBranch:      rig.EffectiveDefaultBranch(),
+				Suspended:          eff.Suspended,
+				SuspendedSource:    suspendedSourceLabel(eff.Source),
+				SuspendedUpdatedAt: suspendedUpdatedAtPtr(eff),
+				Beads:              rigBeadsStatus(fsys.OSFS{}, rig.Path),
 			},
 		}
 		for _, a := range cr.Body.Agents {
@@ -225,10 +275,10 @@ func renderRigStatusFromAPI(cr api.CachedRead[api.StatusView], rig config.Rig, d
 		return 0
 	}
 
-	fmt.Fprintf(stdout, "%s:\n", rig.Name)              //nolint:errcheck // best-effort stdout
-	fmt.Fprintf(stdout, "  Path:       %s\n", rig.Path) //nolint:errcheck // best-effort stdout
-	fmt.Fprintf(stdout, "  Suspended:  %s\n", suspStr)  //nolint:errcheck // best-effort stdout
-	fmt.Fprintf(stdout, "  Agents:\n")                  //nolint:errcheck // best-effort stdout
+	fmt.Fprintf(stdout, "%s:\n", rig.Name)                              //nolint:errcheck // best-effort stdout
+	fmt.Fprintf(stdout, "  Path:       %s\n", rig.Path)                 //nolint:errcheck // best-effort stdout
+	fmt.Fprintf(stdout, "  Suspended:  %s\n", formatSuspendedLine(eff)) //nolint:errcheck // best-effort stdout
+	fmt.Fprintf(stdout, "  Agents:\n")                                  //nolint:errcheck // best-effort stdout
 
 	for _, a := range cr.Body.Agents {
 		if !rigStatusAgentBelongsToRig(a, rig.Name) {
@@ -294,16 +344,12 @@ func doRigStatusWithStoreAndSnapshot(
 		return renderRigStatusJSON(sp, dops, rig, agents, cityPath, cityName, sessionTemplate, cfg, store, statusSnapshot, stdout, stderr)
 	}
 
-	suspState, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
-	suspStr := "no"
-	if suspensionstate.EffectiveRigSuspended(suspState, rig.Name, rig.EffectiveSuspendedOnStart()) {
-		suspStr = "yes"
-	}
+	eff := rigStatusSuspension(cityPath, rig)
 
-	fmt.Fprintf(stdout, "%s:\n", rig.Name)              //nolint:errcheck // best-effort stdout
-	fmt.Fprintf(stdout, "  Path:       %s\n", rig.Path) //nolint:errcheck // best-effort stdout
-	fmt.Fprintf(stdout, "  Suspended:  %s\n", suspStr)  //nolint:errcheck // best-effort stdout
-	fmt.Fprintf(stdout, "  Agents:\n")                  //nolint:errcheck // best-effort stdout
+	fmt.Fprintf(stdout, "%s:\n", rig.Name)                              //nolint:errcheck // best-effort stdout
+	fmt.Fprintf(stdout, "  Path:       %s\n", rig.Path)                 //nolint:errcheck // best-effort stdout
+	fmt.Fprintf(stdout, "  Suspended:  %s\n", formatSuspendedLine(eff)) //nolint:errcheck // best-effort stdout
+	fmt.Fprintf(stdout, "  Agents:\n")                                  //nolint:errcheck // best-effort stdout
 
 	for _, a := range agents {
 		sp0 := scaleParamsFor(&a)
@@ -335,17 +381,20 @@ func renderRigStatusJSON(
 	statusSnapshot *sessionBeadSnapshot,
 	stdout, stderr io.Writer,
 ) int {
+	eff := rigStatusSuspension(cityPath, rig)
 	result := RigStatusJSON{
 		SchemaVersion: "1",
 		CityPath:      cityPath,
 		CityName:      cityName,
 		Rig: RigStatusRig{
-			Name:          rig.Name,
-			Path:          rig.Path,
-			Prefix:        rig.EffectivePrefix(),
-			DefaultBranch: rig.EffectiveDefaultBranch(),
-			Suspended:     rig.Suspended,
-			Beads:         rigBeadsStatus(fsys.OSFS{}, rig.Path),
+			Name:               rig.Name,
+			Path:               rig.Path,
+			Prefix:             rig.EffectivePrefix(),
+			DefaultBranch:      rig.EffectiveDefaultBranch(),
+			Suspended:          eff.Suspended,
+			SuspendedSource:    suspendedSourceLabel(eff.Source),
+			SuspendedUpdatedAt: suspendedUpdatedAtPtr(eff),
+			Beads:              rigBeadsStatus(fsys.OSFS{}, rig.Path),
 		},
 	}
 	for _, a := range agents {

@@ -12,11 +12,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/gastownhall/gascity/internal/worker"
 )
 
@@ -155,6 +158,112 @@ func TestDoRigStatusSuspendedRig(t *testing.T) {
 	out := stdout.String()
 	if !strings.Contains(out, "Suspended:  yes") {
 		t.Errorf("stdout missing 'Suspended:  yes', got:\n%s", out)
+	}
+}
+
+// TestRigStatusSuspensionProvenance drives the three suspension-state
+// cases (gc-7dbx0t) directly from a constructed suspensionstate.State
+// plus a config.City, per the bead's acceptance criteria: a runtime
+// override, an authored startup default, and neither.
+func TestRigStatusSuspensionProvenance(t *testing.T) {
+	updatedAt := time.Date(2026, 8, 19, 12, 30, 58, 0, time.UTC)
+
+	cases := []struct {
+		name             string
+		state            suspensionstate.State
+		suspendedOnStart bool
+		wantSuspended    bool
+		wantSource       suspensionstate.Source
+		wantLabel        string
+		wantLineContains []string
+	}{
+		{
+			name: "runtime override",
+			state: suspensionstate.State{
+				Rigs:      map[string]suspensionstate.Override{"decisions": {Suspended: boolPtr(true)}},
+				UpdatedAt: updatedAt,
+			},
+			suspendedOnStart: false,
+			wantSuspended:    true,
+			wantSource:       suspensionstate.SourceRuntimeOverride,
+			wantLabel:        "runtime_override",
+			wantLineContains: []string{"yes", "runtime override", suspensionstate.RelPath, "2026-08-19T12:30:58Z"},
+		},
+		{
+			name:             "startup default",
+			state:            suspensionstate.State{},
+			suspendedOnStart: true,
+			wantSuspended:    true,
+			wantSource:       suspensionstate.SourceStartupDefault,
+			wantLabel:        "startup_default",
+			wantLineContains: []string{"yes", "city.toml suspended_on_start"},
+		},
+		{
+			name:             "neither",
+			state:            suspensionstate.State{},
+			suspendedOnStart: false,
+			wantSuspended:    false,
+			wantSource:       suspensionstate.SourceNone,
+			wantLabel:        "none",
+			wantLineContains: []string{"no"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eff := suspensionstate.EffectiveRig(tc.state, "decisions", tc.suspendedOnStart)
+			if eff.Suspended != tc.wantSuspended {
+				t.Errorf("Suspended = %v, want %v", eff.Suspended, tc.wantSuspended)
+			}
+			if eff.Source != tc.wantSource {
+				t.Errorf("Source = %v, want %v", eff.Source, tc.wantSource)
+			}
+			if got := suspendedSourceLabel(eff.Source); got != tc.wantLabel {
+				t.Errorf("suspendedSourceLabel = %q, want %q", got, tc.wantLabel)
+			}
+			line := formatSuspendedLine(eff)
+			for _, want := range tc.wantLineContains {
+				if !strings.Contains(line, want) {
+					t.Errorf("formatSuspendedLine = %q, missing %q", line, want)
+				}
+			}
+		})
+	}
+}
+
+// TestDoRigStatusSuspendedRigRuntimeOverrideProvenance verifies that
+// "gc rig status" reads the runtime override file for a rig and prints
+// its provenance and timestamp, distinguishing it from the
+// suspended_on_start case asserted by TestDoRigStatusSuspendedRig.
+func TestDoRigStatusSuspendedRigRuntimeOverrideProvenance(t *testing.T) {
+	cityPath := t.TempDir()
+	st := suspensionstate.State{
+		Rigs: map[string]suspensionstate.Override{"frontend": {Suspended: boolPtr(true)}},
+	}
+	if err := suspensionstate.Save(fsys.OSFS{}, cityPath, st); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	saved, err := suspensionstate.Load(fsys.OSFS{}, cityPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	wantUpdatedAt := saved.UpdatedAt.Format(time.RFC3339)
+
+	sp := runtime.NewFake()
+	dops := newFakeDrainOps()
+	rig := config.Rig{Name: "frontend", Path: "/tmp/frontend"}
+
+	var stdout, stderr bytes.Buffer
+	code := runDoRigStatus(sp, dops, rig, nil, cityPath, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Suspended:  yes (runtime override") {
+		t.Errorf("stdout missing runtime override provenance, got:\n%s", out)
+	}
+	if !strings.Contains(out, wantUpdatedAt) {
+		t.Errorf("stdout missing state file updated_at %q, got:\n%s", wantUpdatedAt, out)
 	}
 }
 
