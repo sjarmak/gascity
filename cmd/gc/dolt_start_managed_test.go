@@ -390,6 +390,13 @@ func TestManagedDoltWatchdogExecutableUsesOSExecutable(t *testing.T) {
 	}
 }
 
+func TestManagedDoltWatchdogExecutableRejectsInvalidExplicitGCBin(t *testing.T) {
+	t.Setenv("GC_BIN", "relative-gc")
+	if _, err := managedDoltWatchdogExecutable(); err == nil {
+		t.Fatal("managedDoltWatchdogExecutable accepted invalid explicit GC_BIN")
+	}
+}
+
 type blockingWatchdogPIDReader struct {
 	started chan struct{}
 	unblock chan struct{}

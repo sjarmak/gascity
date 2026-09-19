@@ -61,7 +61,7 @@ func TestInjectionHTTPSMatch(t *testing.T) {
 	writeCredFile(t, filepath.Join(home, "credentials.toml"),
 		"[[credential]]\nmatch=\"github.com/org\"\nhelper=\"gh auth token\"\n", 0o600)
 
-	gcExe := "/opt/my gc/bin/gc" // path with a space to exercise sq-quoting.
+	gcExe := "/opt/my gc/bin/gc " // spaces and trailing whitespace must be preserved.
 	inj, err := CredentialedNetworkArgs(gcExe, "/city", "https://github.com/org/repo")
 	if err != nil {
 		t.Fatalf("CredentialedNetworkArgs: %v", err)
@@ -71,7 +71,7 @@ func TestInjectionHTTPSMatch(t *testing.T) {
 	}
 	wantCfg := []string{
 		"-c", "credential.helper=",
-		"-c", "credential.helper=!'/opt/my gc/bin/gc' git-credential",
+		"-c", "credential.helper=!'/opt/my gc/bin/gc ' git-credential",
 		"-c", "credential.useHttpPath=true",
 	}
 	if !reflect.DeepEqual(inj.CfgArgs, wantCfg) {

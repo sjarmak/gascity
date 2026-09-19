@@ -1018,6 +1018,9 @@ var (
 )
 
 var recoverManagedBDCommand = func(cityPath string) error {
+	if err := validateProviderLifecycleGCBinary(); err != nil {
+		return fmt.Errorf("validate GC_BIN for managed bd recovery: %w", err)
+	}
 	script := gcBeadsBdScriptPath(cityPath)
 	overrides := cityRuntimeEnvMapForCity(cityPath)
 	if err := applyWorkspacePinnedBdBinary(overrides, cityPath); err != nil {

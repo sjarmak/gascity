@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/gchome"
+	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/google/uuid"
 	"golang.org/x/term"
 )
@@ -380,7 +381,7 @@ func OpenProduction(options ProductionOptions) (*Service, error) {
 		now:       time.Now,
 		verifyTTY: productionNoticeWriterIsTTY,
 		spawn: spawnDependencies{
-			executable: os.Executable,
+			executable: processenv.ResolveGCBinary,
 			environ:    os.Environ,
 			start:      platformStartPrivateUploader,
 		},

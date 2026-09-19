@@ -32,6 +32,19 @@ func stubHostedBeadsCredentialExecutable(t *testing.T, executable string) string
 	return shellquote.Quote(absolute) + " internal beads-credential"
 }
 
+func TestHostedBeadsCredentialCommandPreservesExplicitPath(t *testing.T) {
+	original := hostedBeadsCredentialExecutable
+	hostedBeadsCredentialExecutable = func() (string, error) { return "/tmp/gc wrapper ", nil }
+	t.Cleanup(func() { hostedBeadsCredentialExecutable = original })
+	got, err := hostedBeadsCredentialCommand()
+	if err != nil {
+		t.Fatalf("hostedBeadsCredentialCommand: %v", err)
+	}
+	if !strings.Contains(got, "'/tmp/gc wrapper '") {
+		t.Fatalf("command %q did not preserve explicit path", got)
+	}
+}
+
 // TestHostedBeadsCredentialProviderProcess is re-executed by the credential
 // provider tests below. The subprocess records the exact request and returns a
 // protocol-valid credential without placing a bearer in process arguments or

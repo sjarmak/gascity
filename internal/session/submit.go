@@ -18,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/nudgepoller"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/pidutil"
+	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/sessionlog"
 )
@@ -635,7 +636,7 @@ func deferredSubmitPollerKey(b beads.Bead) string {
 
 var (
 	startSessionSubmitPoller      = ensureSessionSubmitPoller
-	sessionSubmitPollerExecutable = os.Executable
+	sessionSubmitPollerExecutable = processenv.ResolveGCBinary
 )
 
 func ensureSessionSubmitPoller(cityPath, agentName, sessionName string) error {

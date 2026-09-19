@@ -30,6 +30,7 @@ import (
 	"github.com/gastownhall/gascity/internal/nudgepoller"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/pidutil"
+	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/runtime/tmux"
 	"github.com/gastownhall/gascity/internal/session"
@@ -2155,7 +2156,7 @@ func ensureNudgePoller(cityPath, agentName, sessionName string) error {
 		if running, _ := existingPollerPID(pidPath, cityPath, sessionName, agentName); running {
 			return nil
 		}
-		exe, err := os.Executable()
+		exe, err := processenv.ResolveGCBinary()
 		if err != nil {
 			return err
 		}

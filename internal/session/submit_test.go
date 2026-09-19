@@ -503,6 +503,13 @@ func TestEnsureSessionSubmitPollerRejectsGoTestExecutable(t *testing.T) {
 	}
 }
 
+func TestEnsureSessionSubmitPollerRejectsInvalidExplicitGCBin(t *testing.T) {
+	t.Setenv("GC_BIN", "relative-gc")
+	if err := ensureSessionSubmitPoller(t.TempDir(), "agent", "invalid-gc-bin"); err == nil {
+		t.Fatal("ensureSessionSubmitPoller accepted invalid explicit GC_BIN")
+	}
+}
+
 func TestExistingSessionSubmitPollerPIDRejectsUnrelatedLivePID(t *testing.T) {
 	cityPath := t.TempDir()
 	pidPath := sessionSubmitPollerPIDPath(cityPath, "s-test", "session-id")

@@ -3,7 +3,6 @@ package api
 import (
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 
@@ -62,9 +61,12 @@ import (
 // drops the inherited entry. GC_CITY_ROOT is pinned too even though
 // citylayout.CityIdentityEnvMap never seeds it, because the guard trips on it
 // and nothing else clears an inherited value.
-func cityAnchoredSessionEnv(cityPath string, workspaceEnv, providerEnv map[string]string) map[string]string {
+func cityAnchoredSessionEnv(cityPath string, workspaceEnv, providerEnv map[string]string) (map[string]string, error) {
 	baseline := processenv.ProviderProcessPassthroughEnv()
-	gcBin, _ := os.Executable()
+	gcBin, resolveErr := processenv.ResolveGCBinary()
+	if resolveErr != nil {
+		return nil, fmt.Errorf("resolving gc executable: %w", resolveErr)
+	}
 
 	out := make(map[string]string, len(baseline)+len(workspaceEnv)+len(providerEnv)+4)
 	for k, v := range baseline {
@@ -88,7 +90,7 @@ func cityAnchoredSessionEnv(cityPath string, workspaceEnv, providerEnv map[strin
 		}
 	}
 	if len(baseline) == 0 && len(workspaceEnv) == 0 && len(providerEnv) == 0 && len(anchors) == 0 && gcBin == "" {
-		return nil
+		return nil, nil
 	}
 	for k, v := range anchors {
 		out[k] = v
@@ -97,7 +99,7 @@ func cityAnchoredSessionEnv(cityPath string, workspaceEnv, providerEnv map[strin
 		out["GC_BIN"] = gcBin
 		processenv.PrependGCBinDirToPATH(out, gcBin)
 	}
-	return convergence.ScrubTokenEnv(out)
+	return convergence.ScrubTokenEnv(out), nil
 }
 
 func configuredWorkspaceSessionEnv(cfg *config.City) map[string]string {
@@ -405,7 +407,10 @@ func (s *Server) buildSessionResume(info session.Info) (string, runtime.Config, 
 	resolvedInfo.ResumeFlag = resolved.ResumeFlag
 	resolvedInfo.ResumeStyle = resolved.ResumeStyle
 	resolvedInfo.ResumeCommand = resumeCommand
-	sessionEnv := cityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved.Env)
+	sessionEnv, err := cityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved.Env)
+	if err != nil {
+		return "", runtime.Config{}, err
+	}
 	return session.BuildResumeCommand(resolvedInfo), sessionResumeHints(resolved, workDir, sessionEnv, mcpServers, sessionResumeInteractive(metadata)), nil
 }
 
@@ -523,7 +528,10 @@ func (s *Server) resolveWorkerSessionRuntimeWithMetadata(info session.Info, _ st
 			resumeCommand = command
 		}
 	}
-	sessionEnv := cityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved.Env)
+	sessionEnv, err := cityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved.Env)
+	if err != nil {
+		return nil, err
+	}
 	runtimeCfg, err := worker.NormalizeResolvedRuntime(worker.ResolvedRuntime{
 		Command:    command,
 		WorkDir:    firstNonEmptyString(info.WorkDir, workDir),
