@@ -6,7 +6,33 @@ description: Finding, creating, claiming, and closing work items (beads)
 # Work Items (Beads)
 
 Everything in Gas City is a bead — tasks, messages, molecules, convoys.
-The `gc bd` CLI is the primary interface for bead CRUD.
+The `gc bd` CLI is the primary interface for bead CRUD **in a bd-backed
+scope** (a rig whose `.beads/` resolves to the `bd`/Dolt provider). A
+file-backed scope — for example a city root whose resolved provider is
+`file` — refuses every `gc bd` write verb outright:
+
+```
+gc bd: only supported for bd-backed beads providers (resolved "file" for <scope root>)
+  hint: check city.toml [beads].provider and any per-rig provider overrides.
+```
+
+(The hint text varies — if `GC_BEADS` is set in the environment you may see
+`GC_BEADS env var overrides the provider. Unset it, or set GC_BEADS=bd for
+this scope.` instead. Either way, the first line — `only supported for
+bd-backed beads providers (resolved "file" for ...)` — is the one to match.)
+
+If you hit this, the working directory's resolved provider is `file`, not
+`bd`. Fall back to one of:
+
+```
+GC_BEADS=bd gc bd create "title"  # override the provider for this invocation
+```
+
+— or invoke the underlying `bd` binary directly, bypassing `gc`'s provider
+check, for a file-backed scope where neither of the above applies.
+
+Everything below this section describes the bd-backed case (rigs), where
+`gc bd` works as documented.
 
 ## Rig-scoped beads
 
