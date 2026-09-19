@@ -174,6 +174,11 @@ func TestDeriveRunStepStatus(t *testing.T) {
 		}
 		return beads.Bead{Status: status, Metadata: md}
 	}
+	stepWithOnFail := func(status, outcome, onFail string) beads.Bead {
+		b := step(status, outcome)
+		b.Metadata["gc.on_fail"] = onFail
+		return b
+	}
 	cases := []struct {
 		name string
 		bead beads.Bead
@@ -186,6 +191,11 @@ func TestDeriveRunStepStatus(t *testing.T) {
 		{"closed-fail", step("closed", "fail"), RunStepStatusFailed},
 		{"closed-skipped", step("closed", "skipped"), RunStepStatusSkipped},
 		{"closed-canceled", step("closed", "canceled"), RunStepStatusCanceled},
+		// gc-ev8ld3: a closed abort_scope step with no recognized terminal
+		// outcome must render failed, matching beadmeta.IsOutcomeFailed /
+		// the workflow finalizer, not RunStepStatusCompleted.
+		{"closed-no-outcome-abort-scope", stepWithOnFail("closed", "", "abort_scope"), RunStepStatusFailed},
+		{"closed-no-outcome-no-abort-scope", step("closed", ""), RunStepStatusCompleted},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

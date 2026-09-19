@@ -491,6 +491,15 @@ func deriveRunStepStatus(b beads.Bead) RunStepStatus {
 		case beadmeta.OutcomeCanceled:
 			return RunStepStatusCanceled
 		}
+		// No recognized terminal outcome. Apply the same fail-closed default
+		// the workflow finalizer uses (beadmeta.IsOutcomeFailed): a bead that
+		// opted into gc.on_fail=abort_scope and closed without a pass/skip/
+		// cancel outcome is a failure, not a completion. Otherwise this step
+		// renders as done in the dashboard while the finalizer already
+		// treats it as the cause of the workflow's failure.
+		if beadmeta.IsOutcomeFailed(b.Metadata) {
+			return RunStepStatusFailed
+		}
 		return RunStepStatusCompleted
 	case "in_progress":
 		return RunStepStatusActive
