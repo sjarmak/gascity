@@ -980,3 +980,88 @@ func TestRollbackAfterFailedCreateKeepsWorktreeWithUnreadableProvenance(t *testi
 		t.Errorf("rival worktree removed on inconclusive ownership: %v", statErr)
 	}
 }
+
+// TestEnsureExistingBranchRecordsActualBuildBase reproduces gc-ryekpd: when
+// the branch already exists, Ensure attaches it as-is without touching
+// spec.Base, so the tree is built from the branch's own tip, not from
+// whatever origin/main has advanced to. The recorded BaseSHA must describe
+// what the tree was actually built from.
+func TestEnsureExistingBranchRecordsActualBuildBase(t *testing.T) {
+	repo, base := initTestRepo(t)
+	branchTip := runGit(t, repo, "rev-parse", base)
+	runGit(t, repo, "branch", "feat", branchTip)
+
+	// Advance the base ref past the branch's tip, as origin/main would
+	// between the branch's creation and this Ensure call.
+	runGit(t, repo, "commit", "--allow-empty", "-m", "main moved on")
+	advancedBase := runGit(t, repo, "rev-parse", base)
+	if advancedBase == branchTip {
+		t.Fatal("test setup: base did not advance past the branch tip")
+	}
+
+	root := t.TempDir()
+	wt := filepath.Join(root, "gc-test")
+	spec := managedSpec(repo, root, wt, "feat", base)
+
+	rep, err := Ensure(spec)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if rep.Provenance == nil {
+		t.Fatal("Ensure report has nil provenance")
+	}
+	if rep.Provenance.BaseSHA != branchTip {
+		t.Fatalf("recorded BaseSHA = %q, want the branch's own tip %q (advanced base was %q)",
+			rep.Provenance.BaseSHA, branchTip, advancedBase)
+	}
+	if rep.Head != branchTip {
+		t.Fatalf("worktree HEAD = %q, want branch tip %q", rep.Head, branchTip)
+	}
+	// The recorded base must actually be an ancestor of (here, equal to)
+	// HEAD -- the whole point of the fix.
+	descends, err := isAncestor(wt, rep.Provenance.BaseSHA, rep.Head)
+	if err != nil {
+		t.Fatalf("isAncestor: %v", err)
+	}
+	if !descends {
+		t.Fatalf("recorded BaseSHA %q is not an ancestor of HEAD %q", rep.Provenance.BaseSHA, rep.Head)
+	}
+}
+
+// TestVerifyFailsWhenBaseSHAIsNotAncestorOfHead guards the other half of
+// gc-ryekpd: verifyProvenance must not treat a recorded BaseSHA as valid
+// merely because it matches the spec -- it also has to actually be an
+// ancestor of HEAD. A hand-corrupted provenance file with a BaseSHA that is
+// not an ancestor must fail Verify, not verify clean against itself.
+func TestVerifyFailsWhenBaseSHAIsNotAncestorOfHead(t *testing.T) {
+	repo, base := initTestRepo(t)
+	root := t.TempDir()
+	wt := filepath.Join(root, "gc-test")
+	spec := managedSpec(repo, root, wt, "work/gc-test", base)
+
+	if _, err := Ensure(spec); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	// Fabricate a BaseSHA that is not an ancestor of HEAD: a commit made on
+	// an entirely unrelated orphan branch.
+	runGit(t, repo, "checkout", "--orphan", "unrelated")
+	runGit(t, repo, "commit", "--allow-empty", "-m", "unrelated history")
+	bogusBase := runGit(t, repo, "rev-parse", "unrelated")
+	runGit(t, repo, "checkout", base)
+
+	stored, err := readProvenance(wt)
+	if err != nil {
+		t.Fatalf("readProvenance: %v", err)
+	}
+	stored.BaseSHA = bogusBase
+	if err := writeProvenance(wt, stored); err != nil {
+		t.Fatalf("writeProvenance: %v", err)
+	}
+
+	verifySpec := spec
+	verifySpec.BaseSHA = bogusBase
+	if _, err := Verify(verifySpec); err == nil || !strings.Contains(err.Error(), "does not descend from recorded base SHA") {
+		t.Fatalf("Verify with non-ancestor BaseSHA err = %v, want ancestry failure", err)
+	}
+}

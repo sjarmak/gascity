@@ -262,7 +262,7 @@ func Verify(spec Spec) (Report, error) {
 	if err != nil {
 		return rep, fmt.Errorf("verifying worktree %q provenance: %w", spec.Path, err)
 	}
-	if err := verifyProvenance(spec, provenance); err != nil {
+	if err := verifyProvenance(spec, provenance, rep.Head); err != nil {
 		return rep, fmt.Errorf("verifying worktree %q provenance: %w", spec.Path, err)
 	}
 	rep.Provenance = &provenance
@@ -370,12 +370,12 @@ func Ensure(spec Spec) (Report, error) {
 		return rep, verifyErr
 	}
 
-	repoGit, branchExists, resolvedBase, err := resolveCreationState(spec)
+	repoGit, branchExists, resolvedBase, provenanceBase, err := resolveCreationState(spec)
 	if err != nil {
 		return rep, err
 	}
 	if spec.DryRun {
-		return planDryRun(spec, rep, branchExists, resolvedBase)
+		return planDryRun(spec, rep, branchExists, provenanceBase)
 	}
 
 	if err := createWorktree(repoGit, spec, branchExists); err != nil {
@@ -386,7 +386,7 @@ func Ensure(spec Spec) (Report, error) {
 		return rep, rollbackResult(err, rollbackCreated(repoGit, spec.Path, spec.Branch, !branchExists))
 	}
 	if spec.managed() {
-		created, err = publishAndVerifyProvenance(spec, resolvedBase)
+		created, err = publishAndVerifyProvenance(spec, provenanceBase)
 		if err != nil {
 			return rep, rollbackResult(err, rollbackCreated(repoGit, spec.Path, spec.Branch, !branchExists))
 		}
@@ -552,41 +552,55 @@ func isAncestor(workDir, ancestor, descendant string) (bool, error) {
 	return false, fmt.Errorf("git merge-base --is-ancestor: %s: %w", strings.TrimSpace(string(output)), err)
 }
 
-func resolveCreationState(spec Spec) (*git.Git, bool, string, error) {
+func resolveCreationState(spec Spec) (*git.Git, bool, string, string, error) {
 	repoGit := git.New(spec.RepoDir)
 	if !repoGit.IsRepo() {
-		return nil, false, "", fmt.Errorf("ensuring worktree %q: repo dir %q is not a git repository", spec.Path, spec.RepoDir)
+		return nil, false, "", "", fmt.Errorf("ensuring worktree %q: repo dir %q is not a git repository", spec.Path, spec.RepoDir)
 	}
 	branchExists, err := repoGit.BranchExists(spec.Branch)
 	if err != nil {
-		return nil, false, "", fmt.Errorf("ensuring worktree %q: %w", spec.Path, err)
+		return nil, false, "", "", fmt.Errorf("ensuring worktree %q: %w", spec.Path, err)
 	}
 	if !branchExists && spec.Base == "" {
-		return nil, false, "", fmt.Errorf("ensuring worktree %q: branch %q does not exist and no base was given", spec.Path, spec.Branch)
+		return nil, false, "", "", fmt.Errorf("ensuring worktree %q: branch %q does not exist and no base was given", spec.Path, spec.Branch)
 	}
 	var resolvedBase string
 	if spec.Base != "" {
 		sha, err := repoGit.RevParseVerifyCommit(spec.Base)
 		if err != nil {
-			return nil, false, "", fmt.Errorf("ensuring worktree %q: %w", spec.Path, err)
+			return nil, false, "", "", fmt.Errorf("ensuring worktree %q: %w", spec.Path, err)
 		}
 		resolvedBase = sha
 	}
 	if spec.BaseSHA != "" && resolvedBase != spec.BaseSHA {
-		return nil, false, "", fmt.Errorf("ensuring worktree %q: base ref %q resolves to %s, want recorded base SHA %s",
+		return nil, false, "", "", fmt.Errorf("ensuring worktree %q: base ref %q resolves to %s, want recorded base SHA %s",
 			spec.Path, spec.Base, resolvedBase, spec.BaseSHA)
 	}
-	return repoGit, branchExists, resolvedBase, nil
+	// provenanceBase names the commit the tree is actually built from, which
+	// is NOT resolvedBase when the branch already exists: the create path
+	// attaches the existing branch as-is and never touches spec.Base, so
+	// recording resolvedBase would name a commit the tree may not descend
+	// from at all. Record the branch's own current tip instead — the one
+	// commit provably true of the tree the moment it is created.
+	provenanceBase := resolvedBase
+	if branchExists {
+		tip, err := repoGit.RevParseVerifyCommit(spec.Branch)
+		if err != nil {
+			return nil, false, "", "", fmt.Errorf("ensuring worktree %q: resolving existing branch %q tip: %w", spec.Path, spec.Branch, err)
+		}
+		provenanceBase = tip
+	}
+	return repoGit, branchExists, resolvedBase, provenanceBase, nil
 }
 
-func planDryRun(spec Spec, rep Report, branchExists bool, resolvedBase string) (Report, error) {
+func planDryRun(spec Spec, rep Report, branchExists bool, provenanceBase string) (Report, error) {
 	if branchExists {
 		rep.Planned = []string{fmt.Sprintf("git worktree add %s %s", spec.Path, spec.Branch)}
 	} else {
 		rep.Planned = []string{fmt.Sprintf("git worktree add -b %s %s %s", spec.Branch, spec.Path, spec.Base)}
 	}
 	if spec.managed() {
-		provenance, err := plannedProvenance(spec, resolvedBase)
+		provenance, err := plannedProvenance(spec, provenanceBase)
 		if err != nil {
 			return rep, err
 		}
@@ -622,8 +636,8 @@ func verifyCreatedWorktree(spec Spec, branchExists bool, resolvedBase string) (R
 	return created, nil
 }
 
-func publishAndVerifyProvenance(spec Spec, resolvedBase string) (Report, error) {
-	provenance, err := plannedProvenance(spec, resolvedBase)
+func publishAndVerifyProvenance(spec Spec, provenanceBase string) (Report, error) {
+	provenance, err := plannedProvenance(spec, provenanceBase)
 	if err != nil {
 		return Report{}, fmt.Errorf("worktree %q provenance preparation failed: %w", spec.Path, err)
 	}
@@ -914,7 +928,7 @@ func plannedProvenance(spec Spec, resolvedBase string) (Provenance, error) {
 	}, nil
 }
 
-func verifyProvenance(spec Spec, got Provenance) error {
+func verifyProvenance(spec Spec, got Provenance, head string) error {
 	want, err := plannedProvenance(spec, got.BaseSHA)
 	if err != nil {
 		return err
@@ -954,6 +968,19 @@ func verifyProvenance(spec Spec, got Provenance) error {
 	}
 	if got.AttemptID == "" {
 		return errors.New("attempt id is empty")
+	}
+	// Field equality above proves the record matches the spec; it never asks
+	// whether the tree actually descends from the base it names. A recorded
+	// BaseSHA that is not an ancestor of HEAD means the record is lying about
+	// what the worktree was built from, and every downstream consumer that
+	// trusts it (rebase decisions, merge-base computation, diff scoping)
+	// would be reading a false provenance.
+	descends, err := isAncestor(spec.Path, got.BaseSHA, head)
+	if err != nil {
+		return fmt.Errorf("checking base SHA ancestry: %w", err)
+	}
+	if !descends {
+		return fmt.Errorf("HEAD %s does not descend from recorded base SHA %s", head, got.BaseSHA)
 	}
 	return nil
 }
