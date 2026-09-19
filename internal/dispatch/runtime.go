@@ -927,19 +927,7 @@ func preserveScopeCheckForSubject(candidate beads.Bead, deps []beads.Dep, subjec
 // contract violations are classified by retry-eval as transient retries, not
 // scope aborts.
 func beadOutcomeFailed(subject beads.Bead) bool {
-	outcome := strings.TrimSpace(subject.Metadata[beadmeta.OutcomeMetadataKey])
-	if outcome == beadmeta.OutcomeFail {
-		return true
-	}
-	if strings.TrimSpace(subject.Metadata[beadmeta.OnFailMetadataKey]) != "abort_scope" || isRetryAttemptSubject(subject) {
-		return false
-	}
-	switch outcome {
-	case beadmeta.OutcomePass, beadmeta.OutcomeSkipped, beadmeta.OutcomeCanceled:
-		return false
-	default:
-		return true
-	}
+	return beadmeta.IsOutcomeFailed(subject.Metadata)
 }
 
 func isRetryAttemptSubject(subject beads.Bead) bool {

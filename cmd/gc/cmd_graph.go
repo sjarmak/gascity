@@ -7,6 +7,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/spf13/cobra"
@@ -69,11 +70,13 @@ type graphJSONNode struct {
 	BlockedBy    []string `json:"blocked_by"`
 	OpenBlockers []string `json:"open_blockers"`
 	Ready        bool     `json:"ready"`
+	Failed       bool     `json:"failed,omitempty"`
 }
 
 type graphJSONSummary struct {
 	Total   int `json:"total"`
 	Closed  int `json:"closed"`
+	Failed  int `json:"failed"`
 	Ready   int `json:"ready"`
 	Blocked int `json:"blocked"`
 }
@@ -284,9 +287,13 @@ func buildGraphJSONResult(args []string, nodes []graphNode) graphJSONResult {
 	}
 	for _, n := range nodes {
 		ready := isBeadReady(n)
+		failed := beadClosedFailed(n)
 		switch {
 		case n.bead.Status == "closed":
 			result.Summary.Closed++
+			if failed {
+				result.Summary.Failed++
+			}
 		case ready:
 			result.Summary.Ready++
 		default:
@@ -301,6 +308,7 @@ func buildGraphJSONResult(args []string, nodes []graphNode) graphJSONResult {
 			BlockedBy:    append([]string(nil), n.blockedBy...),
 			OpenBlockers: append([]string(nil), n.openBlocker...),
 			Ready:        ready,
+			Failed:       failed,
 		})
 	}
 	result.Summary.Total = len(nodes)
@@ -370,6 +378,8 @@ func printTable(nodes []graphNode, stdout io.Writer) {
 		isReady := isBeadReady(n)
 		var readyStr string
 		switch {
+		case beadClosedFailed(n):
+			readyStr = "failed"
 		case n.bead.Status == "closed":
 			readyStr = "done"
 		case isReady:
@@ -413,9 +423,12 @@ func printMermaid(nodes []graphNode, stdout io.Writer) {
 
 	// Style closed nodes.
 	for _, n := range nodes {
-		if n.bead.Status == "closed" {
+		switch {
+		case beadClosedFailed(n):
+			fmt.Fprintf(stdout, "  style %s fill:#FF6B6B\n", n.bead.ID) //nolint:errcheck // best-effort stdout
+		case n.bead.Status == "closed":
 			fmt.Fprintf(stdout, "  style %s fill:#90EE90\n", n.bead.ID) //nolint:errcheck // best-effort stdout
-		} else if isBeadReady(n) {
+		case isBeadReady(n):
 			fmt.Fprintf(stdout, "  style %s fill:#FFD700\n", n.bead.ID) //nolint:errcheck // best-effort stdout
 		}
 	}
@@ -424,15 +437,28 @@ func printMermaid(nodes []graphNode, stdout io.Writer) {
 // mermaidLabel creates a display label for a mermaid node.
 func mermaidLabel(n graphNode) string {
 	status := ""
-	switch n.bead.Status {
-	case "closed":
+	switch {
+	case beadClosedFailed(n):
+		status = " failed"
+	case n.bead.Status == "closed":
 		status = " done"
-	case "in_progress":
+	case n.bead.Status == "in_progress":
 		status = " ..."
 	}
 	// Escape quotes in titles for mermaid safety.
 	title := strings.ReplaceAll(n.bead.Title, "\"", "'")
 	return fmt.Sprintf("%s%s", title, status)
+}
+
+// beadClosedFailed reports whether a closed bead in the graph counts as
+// failed rather than passed, using the same fail-closed default the workflow
+// finalizer applies (beadmeta.IsOutcomeFailed): a bead closed with
+// gc.outcome=fail, or closed with gc.on_fail=abort_scope and no recognized
+// terminal gc.outcome, is failed even though its status is "closed". Without
+// this, a failed step renders identically to a passed one (✓/"done"/green)
+// here while the finalizer already treats it as failed elsewhere.
+func beadClosedFailed(n graphNode) bool {
+	return n.bead.Status == "closed" && beadmeta.IsOutcomeFailed(n.bead.Metadata)
 }
 
 // isBeadReady reports whether a bead has no open blockers.
@@ -546,6 +572,9 @@ func printTree(nodes []graphNode, stdout io.Writer) {
 func treeStatusIcon(n graphNode) string {
 	switch n.bead.Status {
 	case "closed":
+		if beadClosedFailed(n) {
+			return "✗"
+		}
 		return "✓"
 	case "in_progress", "hooked":
 		return "▶"

@@ -262,6 +262,93 @@ func TestGraphMermaidClosedStyle(t *testing.T) {
 	}
 }
 
+// TestGraphClosedFailedRendersDistinctFromClosedPassed covers gc-ev8ld3: a
+// step bead that closed with gc.on_fail=abort_scope and no recognized
+// terminal gc.outcome (the finalizer's fail-closed default,
+// beadmeta.IsOutcomeFailed) must render distinctly from a genuinely passed
+// closed bead across the tree, table, JSON, and mermaid renderers — not as an
+// indistinguishable green/"done" checkmark.
+func TestGraphClosedFailedRendersDistinctFromClosedPassed(t *testing.T) {
+	store := beads.NewMemStore()
+	_, _ = store.Create(beads.Bead{Title: "dead lane step"}) // gc-1
+	_ = store.SetMetadataBatch("gc-1", map[string]string{"gc.on_fail": "abort_scope"})
+	_ = store.Close("gc-1")
+	_, _ = store.Create(beads.Bead{Title: "passed step"}) // gc-2
+	_ = store.Close("gc-2")
+
+	t.Run("tree", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := doGraph(graphStoresOver(store, nil), []string{"gc-1", "gc-2"}, graphOpts{Tree: true}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("doGraph tree = %d, want 0; stderr: %s", code, stderr.String())
+		}
+		out := stdout.String()
+		if !strings.Contains(out, "✗ gc-1") {
+			t.Errorf("failed-closed bead should show ✗, not ✓:\n%s", out)
+		}
+		if !strings.Contains(out, "✓ gc-2") {
+			t.Errorf("passed-closed bead should still show ✓:\n%s", out)
+		}
+	})
+
+	t.Run("table", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := doGraph(graphStoresOver(store, nil), []string{"gc-1", "gc-2"}, graphOpts{}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("doGraph table = %d, want 0", code)
+		}
+		out := stdout.String()
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, "gc-1") && !strings.Contains(line, "failed") {
+				t.Errorf("gc-1 row should read failed:\n%s", line)
+			}
+			if strings.Contains(line, "gc-2") && !strings.Contains(line, "done") {
+				t.Errorf("gc-2 row should read done:\n%s", line)
+			}
+		}
+	})
+
+	t.Run("json", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := doGraph(graphStoresOver(store, nil), []string{"gc-1", "gc-2"}, graphOpts{JSON: true}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("doGraph json = %d, want 0", code)
+		}
+		var result graphJSONResult
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			t.Fatalf("unmarshal: %v; out: %s", err, stdout.String())
+		}
+		if result.Summary.Failed != 1 {
+			t.Errorf("summary.failed = %d, want 1", result.Summary.Failed)
+		}
+		byID := map[string]graphJSONNode{}
+		for _, n := range result.Nodes {
+			byID[n.ID] = n
+		}
+		if !byID["gc-1"].Failed {
+			t.Errorf("gc-1 node should have failed=true: %+v", byID["gc-1"])
+		}
+		if byID["gc-2"].Failed {
+			t.Errorf("gc-2 node should have failed=false: %+v", byID["gc-2"])
+		}
+	})
+
+	t.Run("mermaid", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := doGraph(graphStoresOver(store, nil), []string{"gc-1", "gc-2"}, graphOpts{Mermaid: true}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("doGraph mermaid = %d, want 0", code)
+		}
+		out := stdout.String()
+		if !strings.Contains(out, "style gc-1 fill:#FF6B6B") {
+			t.Errorf("failed-closed bead should get red style:\n%s", out)
+		}
+		if !strings.Contains(out, "style gc-2 fill:#90EE90") {
+			t.Errorf("passed-closed bead should keep green style:\n%s", out)
+		}
+	})
+}
+
 func TestGraphMermaidLabelEscaping(t *testing.T) {
 	store := beads.NewMemStore()
 	_, _ = store.Create(beads.Bead{Title: `fix "quotes" issue`}) // gc-1
