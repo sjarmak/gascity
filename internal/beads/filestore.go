@@ -1,6 +1,7 @@
 package beads
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -147,6 +148,16 @@ type FileStore struct {
 	path      string
 	locker    Locker // cross-process file lock; nopLocker when unset
 	freshness fileFreshness
+	// lastRawBytes is the exact on-disk content this store last synced its
+	// in-memory state with (from a reload or a save), used by reloadFromDisk
+	// to skip re-parsing when nothing else has touched the file. nil means
+	// unknown — always forces a parse.
+	lastRawBytes []byte
+	// reloadParses counts json.Unmarshal invocations inside reloadFromDisk.
+	// It has no production behavior; it exists so tests can prove the
+	// unchanged-file fast path actually skips the parse rather than merely
+	// re-reading identical bytes.
+	reloadParses int
 }
 
 var _ ConditionalAssignmentReleaser = (*FileStore)(nil)
@@ -239,25 +250,42 @@ func (fs *FileStore) SetLocker(l Locker) {
 	fs.locker = l
 }
 
-// reloadFromDisk re-reads the store file and replaces the in-memory state.
-// Must be called with fmu held. Used after acquiring a cross-process flock to
-// pick up changes made by other processes since we last read.
+// reloadFromDisk re-reads the store file and, only when its bytes differ from
+// lastRawBytes (the content our in-memory state was last synced with, from a
+// prior reload or our own save), re-parses it and replaces the in-memory
+// state. Must be called with fmu held. Used after acquiring a cross-process
+// flock to pick up changes made by other processes since we last read.
+//
+// Skipping the parse on a byte-for-byte match is always safe regardless of
+// how the match was detected (no mtime/size heuristic is involved): identical
+// bytes mean the file holds exactly the state our in-memory copy already
+// reflects, so re-parsing it would reproduce the same MemStore contents. This
+// is the fast path that makes single-bead mutations cheap on a large store
+// when nothing else has written to it since our last read or write; a real
+// external write, however coincidentally it may match the old size or mtime,
+// always changes the bytes and is therefore always caught here.
 func (fs *FileStore) reloadFromDisk() error {
 	data, err := fs.fs.ReadFile(fs.path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// File hasn't been created yet — keep current in-memory state.
+			fs.lastRawBytes = nil
 			return nil
 		}
 		return fmt.Errorf("reloading file store: %w", err)
 	}
+	if fs.lastRawBytes != nil && bytes.Equal(data, fs.lastRawBytes) {
+		return nil
+	}
 	var fd fileData
+	fs.reloadParses++
 	if err := json.Unmarshal(data, &fd); err != nil {
 		return fmt.Errorf("reloading file store: %w", err)
 	}
 	applyBeadRevisionsSealed(&fd)
 	applyBeadFences(fd.Beads, fd.Fences)
 	fs.restoreFrom(fd.Seq, fd.Beads, fd.Deps)
+	fs.lastRawBytes = data
 	return nil
 }
 
@@ -739,5 +767,6 @@ func (fs *FileStore) save() error {
 		return fmt.Errorf("saving file store: %w", err)
 	}
 	fs.refreshFreshnessCache()
+	fs.lastRawBytes = data
 	return nil
 }

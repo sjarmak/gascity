@@ -933,6 +933,53 @@ func TestFileStoreMutatorReloadsSameSizeExternalRewriteWithUnchangedFreshness(t 
 	}
 }
 
+// TestFileStoreMutatorContentCheckSurvivesIdenticalStat is the ambiguous case
+// a size+mtime detector alone cannot distinguish: an external rewrite that
+// lands on the exact same size AND the exact same mtime as the file this
+// handle last wrote. gc-q9m9tk's fast path never trusts stat for the skip
+// decision — it always compares the actual on-disk bytes it just read against
+// the bytes it last synced with — so even a forged size+mtime collision like
+// this one cannot cause the second write to lose the external change.
+func TestFileStoreMutatorContentCheckSurvivesIdenticalStat(t *testing.T) {
+	f := fsys.NewFake()
+	path := "/city/.gc/beads.json"
+
+	s, err := beads.OpenFileStore(f, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := s.Create(beads.Bead{Title: strings.Repeat("a", 32)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalModTime := f.ModTimes[path]
+	originalLen := len(f.Files[path])
+
+	updatedTitle := rewriteTitleKeepingFileSize(t, f, path, created.ID, originalLen)
+	if gotLen := len(f.Files[path]); gotLen != originalLen {
+		t.Fatalf("expected same-size external rewrite, got %d -> %d bytes", originalLen, gotLen)
+	}
+	// Forge an identical mtime too: from a Stat-only fast path's point of
+	// view, this file now looks byte-for-byte unchanged from what s last
+	// wrote (same size, same mtime), even though the content differs.
+	f.ModTimes[path] = originalModTime
+
+	if err := s.SetMetadata(created.ID, "owner", "controller"); err != nil {
+		t.Fatalf("SetMetadata(%q) after identical-stat external rewrite: %v", created.ID, err)
+	}
+
+	got, err := s.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get(%q) after identical-stat external rewrite: %v", created.ID, err)
+	}
+	if got.Title != updatedTitle {
+		t.Fatalf("Title after identical-stat external rewrite = %q, want %q (external change must not be lost)", got.Title, updatedTitle)
+	}
+	if got.Metadata["owner"] != "controller" {
+		t.Fatalf("metadata[owner] after identical-stat external rewrite = %q, want controller", got.Metadata["owner"])
+	}
+}
+
 func rewriteTitleKeepingFileSize(t *testing.T, f *fsys.Fake, path, id string, targetLen int) string {
 	t.Helper()
 
