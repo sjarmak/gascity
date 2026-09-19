@@ -103,6 +103,17 @@ check that reads the repository outside its own package
 the wall clock (a dated waiver) can be served a pass it earned on a different
 tree or a different day. Pass `-count=1` whenever a test result is evidence.
 
+**A shared scratch path does not identify your own run.** The observable test
+runner writes its JSONL to `/var/tmp/gascity-test.jsonl.<random>`, and several
+seats run suites concurrently on this host, so
+`ls -t /var/tmp/gascity-test.jsonl.* | head -1` returns whichever run wrote last,
+not yours. Measured 2026-09-19 while gating `work/gc-862ssa`: a tally taken that
+way reported 125 packages for a run that had actually covered 179, because it had
+parsed another seat's concurrent suite. Take the path from the line the runner
+prints on its own completion (`observable go test: PASS log=<path>`) and parse
+only that file. The same caution applies to any `/var/tmp` or `/tmp` artifact a
+sibling seat also produces.
+
 Fix one by porting the LATER semantics onto main's current structure. Collapsing
 the refactor back to its pre-split form silences the compiler by reverting the
 earlier PR.
