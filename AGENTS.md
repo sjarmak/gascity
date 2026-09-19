@@ -89,6 +89,20 @@ git worktree add -q --detach /var/tmp/mainbuild origin/main   # /var/tmp, not /t
 cd /var/tmp/mainbuild && go build ./cmd/gc/ && go vet ./...
 ```
 
+**A worktree you cut earlier is not a clean worktree.** Cutting one is cheap.
+The expensive mistake is reusing one from an earlier probe after cherry-picking
+into it. Measured 2026-09-19: a test result was attributed to plain
+`origin/main` from a tree that carried a five-commit stack, which inverted the
+conclusion about which change caused the failure. Run `git rev-parse HEAD`
+against the ref you mean before any result from that tree becomes evidence, and
+prefer a fresh `git worktree add` per probe over a long-lived scratch tree.
+
+**The test cache will hand you a stale pass.** `go test` caches by input, so a
+check that reads the repository outside its own package
+(`internal/testpolicy/resourcecensus` walks every tracked Go file) or that reads
+the wall clock (a dated waiver) can be served a pass it earned on a different
+tree or a different day. Pass `-count=1` whenever a test result is evidence.
+
 Fix one by porting the LATER semantics onto main's current structure. Collapsing
 the refactor back to its pre-split form silences the compiler by reverting the
 earlier PR.
