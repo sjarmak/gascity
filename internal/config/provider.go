@@ -189,6 +189,19 @@ type ProviderSpec struct {
 	// ACPArgs overrides Args when the session transport is ACP.
 	// When nil, Args is used for both tmux and ACP transports.
 	ACPArgs []string `toml:"acp_args,omitempty"`
+	// Account declares the underlying account this provider authenticates
+	// against (e.g. "codex-2"). Multiple provider names sharing one account
+	// (distinct CODEX_HOME values, distinct claude-account argv) declare the
+	// same Account string so the pool admission cap walker can group them
+	// for a single account-wide max_active_sessions cap instead of capping
+	// each provider name independently. Empty means the provider has no
+	// declared account grouping and is not subject to an account cap.
+	Account string `toml:"account,omitempty"`
+	// AccountMaxActiveSessions caps the combined active session count across
+	// every provider name declaring the same Account. Declare it on any one
+	// provider sharing the account; nil means unlimited. Consulted only when
+	// Account is non-empty.
+	AccountMaxActiveSessions *int `toml:"account_max_active_sessions,omitempty" jsonschema:"minimum=0"`
 }
 
 // Reserved prefixes for the Base field.
@@ -255,6 +268,11 @@ type ResolvedProvider struct {
 	TitleModel             string
 	ACPCommand             string
 	ACPArgs                []string
+	// Account is the resolved account grouping key. See ProviderSpec.Account.
+	Account string
+	// AccountMaxActiveSessions is the resolved account-wide cap. See
+	// ProviderSpec.AccountMaxActiveSessions.
+	AccountMaxActiveSessions *int
 	// EffectiveDefaults is the fully-merged option default map.
 	// Computed from: schema Default -> provider OptionDefaults -> agent OptionDefaults.
 	// Used by ResolveDefaultArgs() to produce CLI flags and by the API to

@@ -2406,6 +2406,15 @@
           "type": "array",
           "description": "EnvRemove lists env var keys to remove."
         },
+        "account": {
+          "type": "string",
+          "description": "Account overrides the provider's declared account grouping key."
+        },
+        "account_max_active_sessions": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "AccountMaxActiveSessions overrides the account-wide session cap."
+        },
         "_replace": {
           "type": "boolean",
           "description": "Replace replaces the entire provider block instead of deep-merging."
@@ -2581,6 +2590,15 @@
           },
           "type": "array",
           "description": "ACPArgs overrides Args when the session transport is ACP.\nWhen nil, Args is used for both tmux and ACP transports."
+        },
+        "account": {
+          "type": "string",
+          "description": "Account declares the underlying account this provider authenticates\nagainst (e.g. \"codex-2\"). Multiple provider names sharing one account\n(distinct CODEX_HOME values, distinct claude-account argv) declare the\nsame Account string so the pool admission cap walker can group them\nfor a single account-wide max_active_sessions cap instead of capping\neach provider name independently. Empty means the provider has no\ndeclared account grouping and is not subject to an account cap."
+        },
+        "account_max_active_sessions": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "AccountMaxActiveSessions caps the combined active session count across\nevery provider name declaring the same Account. Declare it on any one\nprovider sharing the account; nil means unlimited. Consulted only when\nAccount is non-empty."
         }
       },
       "additionalProperties": false,

@@ -1368,6 +1368,16 @@ func deepMergeProvider(base, frag ProviderSpec, name string, fragMeta toml.MetaD
 			func() bool { return base.AcceptStartupDialogs != nil },
 			func() { result.AcceptStartupDialogs = cloneBoolPtr(frag.AcceptStartupDialogs) },
 		},
+		{
+			"account",
+			func() bool { return base.Account != "" },
+			func() { result.Account = frag.Account },
+		},
+		{
+			"account_max_active_sessions",
+			func() bool { return base.AccountMaxActiveSessions != nil },
+			func() { result.AccountMaxActiveSessions = copyIntPtr(frag.AccountMaxActiveSessions) },
+		},
 	}
 	for _, sf := range scalars {
 		if fragMeta.IsDefined("providers", name, sf.key) {

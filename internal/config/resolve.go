@@ -322,6 +322,13 @@ func MergeProviderOverBuiltin(base, city ProviderSpec) ProviderSpec {
 	if city.ACPCommand != "" {
 		result.ACPCommand = city.ACPCommand
 	}
+	if city.Account != "" {
+		result.Account = city.Account
+	}
+	if city.AccountMaxActiveSessions != nil {
+		v := *city.AccountMaxActiveSessions
+		result.AccountMaxActiveSessions = &v
+	}
 
 	// Slice fields: replace entirely when non-nil.
 	if city.Args != nil {
@@ -618,25 +625,27 @@ func detectProviderName(lookPath LookPathFunc) (string, error) {
 // specToResolved converts a ProviderSpec to a ResolvedProvider.
 func specToResolved(name string, spec *ProviderSpec) *ResolvedProvider {
 	rp := &ResolvedProvider{
-		Name:                   name,
-		Command:                spec.Command,
-		PromptMode:             spec.PromptMode,
-		PromptFlag:             spec.PromptFlag,
-		ReadyDelayMs:           spec.ReadyDelayMs,
-		ReadyPromptPrefix:      spec.ReadyPromptPrefix,
-		EmitsPermissionWarning: derefBool(spec.EmitsPermissionWarning),
-		AcceptStartupDialogs:   cloneBoolPtr(spec.AcceptStartupDialogs),
-		SupportsACP:            derefBool(spec.SupportsACP),
-		SupportsHooks:          derefBool(spec.SupportsHooks),
-		InstructionsFile:       spec.InstructionsFile,
-		ResumeFlag:             spec.ResumeFlag,
-		ResumeStyle:            spec.ResumeStyle,
-		ResumeCommand:          spec.ResumeCommand,
-		SessionIDFlag:          spec.SessionIDFlag,
-		ForkFlag:               spec.ForkFlag,
-		TitleModel:             spec.TitleModel,
-		ACPCommand:             spec.ACPCommand,
-		UpstreamEnv:            spec.UpstreamEnv,
+		Name:                     name,
+		Command:                  spec.Command,
+		PromptMode:               spec.PromptMode,
+		PromptFlag:               spec.PromptFlag,
+		ReadyDelayMs:             spec.ReadyDelayMs,
+		ReadyPromptPrefix:        spec.ReadyPromptPrefix,
+		EmitsPermissionWarning:   derefBool(spec.EmitsPermissionWarning),
+		AcceptStartupDialogs:     cloneBoolPtr(spec.AcceptStartupDialogs),
+		SupportsACP:              derefBool(spec.SupportsACP),
+		SupportsHooks:            derefBool(spec.SupportsHooks),
+		InstructionsFile:         spec.InstructionsFile,
+		ResumeFlag:               spec.ResumeFlag,
+		ResumeStyle:              spec.ResumeStyle,
+		ResumeCommand:            spec.ResumeCommand,
+		SessionIDFlag:            spec.SessionIDFlag,
+		ForkFlag:                 spec.ForkFlag,
+		TitleModel:               spec.TitleModel,
+		ACPCommand:               spec.ACPCommand,
+		UpstreamEnv:              spec.UpstreamEnv,
+		Account:                  spec.Account,
+		AccountMaxActiveSessions: copyIntPtr(spec.AccountMaxActiveSessions),
 	}
 	// Deep-copy OptionsSchema to avoid aliasing the spec's slice.
 	if len(spec.OptionsSchema) > 0 {
@@ -873,6 +882,12 @@ func resolvedChainToSpec(r ResolvedProvider, leaf ProviderSpec) ProviderSpec {
 	}
 	if r.ACPCommand != "" {
 		out.ACPCommand = r.ACPCommand
+	}
+	if r.Account != "" {
+		out.Account = r.Account
+	}
+	if r.AccountMaxActiveSessions != nil {
+		out.AccountMaxActiveSessions = copyIntPtr(r.AccountMaxActiveSessions)
 	}
 	if r.ACPArgs != nil {
 		out.ACPArgs = make([]string, len(r.ACPArgs))

@@ -6043,6 +6043,19 @@
               "null"
             ]
           },
+          "Account": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "AccountMaxActiveSessions": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "Args": {
             "items": {
               "type": "string"
@@ -6135,6 +6148,8 @@
           "AcceptStartupDialogs",
           "Env",
           "EnvRemove",
+          "Account",
+          "AccountMaxActiveSessions",
           "Replace"
         ],
         "type": "object"

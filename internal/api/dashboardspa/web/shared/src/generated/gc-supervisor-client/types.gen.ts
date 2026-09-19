@@ -2417,6 +2417,8 @@ export type ProviderPatch = {
     ACPArgs: Array<string> | null;
     ACPCommand: string | null;
     AcceptStartupDialogs: boolean | null;
+    Account: string | null;
+    AccountMaxActiveSessions: number | null;
     Args: Array<string> | null;
     ArgsAppend: Array<string> | null;
     Base: string | null;

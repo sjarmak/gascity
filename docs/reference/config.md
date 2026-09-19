@@ -703,6 +703,8 @@ ProviderPatch modifies an existing provider identified by Name.
 | `accept_startup_dialogs` | boolean |  |  | AcceptStartupDialogs overrides startup dialog acceptance behavior. |
 | `env` | map[string]string |  |  | Env adds or overrides environment variables. |
 | `env_remove` | []string |  |  | EnvRemove lists env var keys to remove. |
+| `account` | string |  |  | Account overrides the provider's declared account grouping key. |
+| `account_max_active_sessions` | integer |  |  | AccountMaxActiveSessions overrides the account-wide session cap. |
 | `_replace` | boolean |  |  | Replace replaces the entire provider block instead of deep-merging. |
 
 ## ProviderSpec
@@ -742,6 +744,8 @@ ProviderSpec defines a named provider's startup parameters.
 | `title_model` | string |  |  | TitleModel is the OptionsSchema model key used for title generation. Resolved via the "model" option in OptionsSchema to get FlagArgs. Defaults to the cheapest/fastest model for each provider. Examples: "haiku" (claude), "o4-mini" (codex), "gemini-2.5-flash" (gemini) |
 | `acp_command` | string |  |  | ACPCommand overrides Command when the session transport is ACP. When empty, Command is used for both tmux and ACP transports. |
 | `acp_args` | []string |  |  | ACPArgs overrides Args when the session transport is ACP. When nil, Args is used for both tmux and ACP transports. |
+| `account` | string |  |  | Account declares the underlying account this provider authenticates against (e.g. "codex-2"). Multiple provider names sharing one account (distinct CODEX_HOME values, distinct claude-account argv) declare the same Account string so the pool admission cap walker can group them for a single account-wide max_active_sessions cap instead of capping each provider name independently. Empty means the provider has no declared account grouping and is not subject to an account cap. |
+| `account_max_active_sessions` | integer |  |  | AccountMaxActiveSessions caps the combined active session count across every provider name declaring the same Account. Declare it on any one provider sharing the account; nil means unlimited. Consulted only when Account is non-empty. |
 
 ## Rig
 

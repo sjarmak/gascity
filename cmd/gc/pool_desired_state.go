@@ -907,8 +907,8 @@ func poolSessionConsumesNewDemandInfo(info sessionpkg.Info) bool {
 	return state == "creating" || state == string(sessionpkg.StateStartPending)
 }
 
-// applyNestedCaps enforces workspace, rig, and agent max_active_sessions caps.
-// Accepts requests in priority order, rejecting any that would exceed a cap.
+// applyNestedCaps enforces workspace, rig, agent, and account max_active_sessions
+// caps. Accepts requests in priority order, rejecting any that would exceed a cap.
 func applyNestedCaps(cfg *config.City, requests []SessionRequest, aliasHeldTemplates map[string]struct{}, trace *sessionReconcilerTraceCycle) []PoolDesiredState {
 	// Sort by priority DESC, resume tier first within same priority.
 	sort.SliceStable(requests, func(i, j int) bool {
@@ -1002,14 +1002,56 @@ type nestedCapLimits struct {
 	rigMax       map[string]int
 	agentMax     map[string]int
 	agentRig     map[string]string
+	accountMax   map[string]int
+	agentAccount map[string]string
 }
 
 type nestedCapUsage struct {
 	agentCount      map[string]int
 	rigCount        map[string]int
+	accountCount    map[string]int
 	workspaceCount  int
 	seenSessionBead map[string]bool
 	requests        []SessionRequest
+}
+
+// providerAccountForName resolves the declared Account grouping key for a
+// provider name: the resolved-chain cache when available (custom providers
+// after BuildResolvedProviderCache), falling back to the raw declared spec.
+// Built-in providers and providers with no declared account return "".
+func providerAccountForName(cfg *config.City, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if cfg.ResolvedProviders != nil {
+		if rp, ok := cfg.ResolvedProviders[name]; ok {
+			return strings.TrimSpace(rp.Account)
+		}
+	}
+	if spec, ok := cfg.Providers[name]; ok {
+		return strings.TrimSpace(spec.Account)
+	}
+	return ""
+}
+
+// providerAccountMaxForName resolves the declared AccountMaxActiveSessions
+// for a provider name, preferring the resolved-chain cache. Nil means
+// unlimited (or undeclared).
+func providerAccountMaxForName(cfg *config.City, name string) *int {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	if cfg.ResolvedProviders != nil {
+		if rp, ok := cfg.ResolvedProviders[name]; ok {
+			return rp.AccountMaxActiveSessions
+		}
+	}
+	if spec, ok := cfg.Providers[name]; ok {
+		return spec.AccountMaxActiveSessions
+	}
+	return nil
 }
 
 func newNestedCapLimits(cfg *config.City) nestedCapLimits {
@@ -1018,6 +1060,8 @@ func newNestedCapLimits(cfg *config.City) nestedCapLimits {
 		rigMax:       make(map[string]int),
 		agentMax:     make(map[string]int),
 		agentRig:     make(map[string]string),
+		accountMax:   make(map[string]int),
+		agentAccount: make(map[string]string),
 	}
 	if cfg.Workspace.MaxActiveSessions != nil {
 		limits.workspaceMax = *cfg.Workspace.MaxActiveSessions
@@ -1027,6 +1071,17 @@ func newNestedCapLimits(cfg *config.City) nestedCapLimits {
 			limits.rigMax[rig.Name] = *rig.MaxActiveSessions
 		} else {
 			limits.rigMax[rig.Name] = -1
+		}
+	}
+	for name := range cfg.Providers {
+		account := providerAccountForName(cfg, name)
+		if account == "" {
+			continue
+		}
+		if accountMax := providerAccountMaxForName(cfg, name); accountMax != nil {
+			limits.accountMax[account] = *accountMax
+		} else if _, ok := limits.accountMax[account]; !ok {
+			limits.accountMax[account] = -1
 		}
 	}
 	for i := range cfg.Agents {
@@ -1039,6 +1094,11 @@ func newNestedCapLimits(cfg *config.City) nestedCapLimits {
 		} else {
 			limits.agentMax[template] = -1
 		}
+		providerName := agent.Provider
+		if strings.TrimSpace(providerName) == "" {
+			providerName = cfg.Workspace.Provider
+		}
+		limits.agentAccount[template] = providerAccountForName(cfg, providerName)
 	}
 	return limits
 }
@@ -1047,6 +1107,7 @@ func newNestedCapUsage() nestedCapUsage {
 	return nestedCapUsage{
 		agentCount:      make(map[string]int),
 		rigCount:        make(map[string]int),
+		accountCount:    make(map[string]int),
 		seenSessionBead: make(map[string]bool),
 	}
 }
@@ -1087,6 +1148,15 @@ func capNewDemandCount(limits nestedCapLimits, usage nestedCapUsage, agent *conf
 		}
 		if rigMax >= 0 {
 			remaining = minInt(remaining, rigMax-usage.rigCount[rig])
+		}
+	}
+	if account := limits.agentAccount[template]; account != "" {
+		accountMax, ok := limits.accountMax[account]
+		if !ok {
+			accountMax = -1
+		}
+		if accountMax >= 0 {
+			remaining = minInt(remaining, accountMax-usage.accountCount[account])
 		}
 	}
 	if limits.workspaceMax >= 0 {
@@ -1134,6 +1204,21 @@ func (u nestedCapUsage) rejection(req SessionRequest, limits nestedCapLimits) (T
 			}, true
 		}
 	}
+	account := limits.agentAccount[template]
+	if account != "" {
+		accountMax, ok := limits.accountMax[account]
+		if !ok {
+			accountMax = -1
+		}
+		if accountMax >= 0 && u.accountCount[account] >= accountMax {
+			return TraceSitePoolAccountCap, TraceReasonAccountCap, traceRecordPayload{
+				"account":     account,
+				"account_max": accountMax,
+				"current":     u.accountCount[account],
+				"tier":        req.Tier,
+			}, true
+		}
+	}
 	if limits.workspaceMax >= 0 && u.workspaceCount >= limits.workspaceMax {
 		return TraceSitePoolWorkspaceCap, TraceReasonWorkspaceCap, traceRecordPayload{
 			"workspace_max": limits.workspaceMax,
@@ -1148,6 +1233,9 @@ func (u *nestedCapUsage) accept(req SessionRequest, limits nestedCapLimits) {
 	u.agentCount[req.Template]++
 	if rig := limits.agentRig[req.Template]; rig != "" {
 		u.rigCount[rig]++
+	}
+	if account := limits.agentAccount[req.Template]; account != "" {
+		u.accountCount[account]++
 	}
 	u.workspaceCount++
 	if req.SessionBeadID != "" {
@@ -1217,6 +1305,17 @@ func newDemandBlockingScope(
 					return limits.agentRig[req.Template] == rig
 				})
 			}
+		}
+	}
+	if account := limits.agentAccount[template]; account != "" {
+		accountMax, ok := limits.accountMax[account]
+		if !ok {
+			accountMax = -1
+		}
+		if accountMax >= 0 && accountMax-usage.accountCount[account] <= newCount {
+			return TraceSitePoolNewDemandCap, TraceReasonAccountCap, accountMax, usage.accountCount[account], filterCapBlockers(usage.requests, func(req SessionRequest) bool {
+				return limits.agentAccount[req.Template] == account
+			})
 		}
 	}
 	if limits.workspaceMax >= 0 && limits.workspaceMax-usage.workspaceCount <= newCount {

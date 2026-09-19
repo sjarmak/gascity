@@ -733,6 +733,71 @@ func TestComputePoolDesiredStates_UnlimitedWhenUnset(t *testing.T) {
 	}
 }
 
+// TestComputePoolDesiredStates_AccountCap verifies the account dimension of
+// applyNestedCaps: two DIFFERENT provider names ("codex-2", "codex-w2")
+// declaring the SAME account ("acct-2") share one account-wide cap. Combined
+// demand across both provider names exceeds the cap, and the excess is
+// rejected in priority order (lower-priority agent's request is the one cut).
+func TestComputePoolDesiredStates_AccountCap(t *testing.T) {
+	accountMax := 3
+	cfg := &config.City{
+		Providers: map[string]config.ProviderSpec{
+			"codex-2":  {Command: "codex", Account: "acct-2", AccountMaxActiveSessions: &accountMax},
+			"codex-w2": {Command: "codex", Account: "acct-2"},
+		},
+		Agents: []config.Agent{
+			{Name: "worker-a", Provider: "codex-2"},
+			{Name: "worker-b", Provider: "codex-w2"},
+		},
+	}
+	scaleCheck := map[string]int{"worker-a": 2, "worker-b": 2}
+
+	result := ComputePoolDesiredStates(cfg, nil, nil, scaleCheck)
+
+	total := 0
+	perAgent := make(map[string]int)
+	for _, ds := range result {
+		perAgent[ds.Template] = len(ds.Requests)
+		total += len(ds.Requests)
+	}
+	if total != accountMax {
+		t.Errorf("total = %d, want %d (account cap across both provider names)", total, accountMax)
+	}
+	if perAgent["worker-a"] != 2 {
+		t.Errorf("worker-a (higher priority, same order) = %d, want 2", perAgent["worker-a"])
+	}
+	if perAgent["worker-b"] != 1 {
+		t.Errorf("worker-b = %d, want 1 (excess rejected by the shared account cap)", perAgent["worker-b"])
+	}
+}
+
+// TestComputePoolDesiredStates_AccountCap_UnlimitedWhenUnset verifies that a
+// declared account with no AccountMaxActiveSessions is unlimited, matching
+// the existing per-agent/per-rig/per-workspace unlimited-when-unset behavior.
+func TestComputePoolDesiredStates_AccountCap_UnlimitedWhenUnset(t *testing.T) {
+	cfg := &config.City{
+		Providers: map[string]config.ProviderSpec{
+			"codex-2":  {Command: "codex", Account: "acct-2"},
+			"codex-w2": {Command: "codex", Account: "acct-2"},
+		},
+		Agents: []config.Agent{
+			{Name: "worker-a", Provider: "codex-2"},
+			{Name: "worker-b", Provider: "codex-w2"},
+		},
+	}
+	scaleCheck := map[string]int{"worker-a": 3, "worker-b": 3}
+
+	result := ComputePoolDesiredStates(cfg, nil, nil, scaleCheck)
+
+	total := 0
+	for _, ds := range result {
+		total += len(ds.Requests)
+	}
+	if total != 6 {
+		t.Errorf("total = %d, want 6 (unlimited account cap)", total)
+	}
+}
+
 func TestComputePoolDesiredStates_ClosedSessionNotResumed(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{poolAgent("claude", "", nil, 0)},

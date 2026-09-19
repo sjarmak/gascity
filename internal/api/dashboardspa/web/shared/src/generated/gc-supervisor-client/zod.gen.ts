@@ -1211,6 +1211,8 @@ export const zProviderPatch = z.object({
     ACPArgs: z.array(z.string()).nullable(),
     ACPCommand: z.string().nullable(),
     AcceptStartupDialogs: z.boolean().nullable(),
+    Account: z.string().nullable(),
+    AccountMaxActiveSessions: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }).nullable(),
     Args: z.array(z.string()).nullable(),
     ArgsAppend: z.array(z.string()).nullable(),
     Base: z.string().nullable(),

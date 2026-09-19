@@ -266,6 +266,10 @@ type ProviderPatch struct {
 	Env map[string]string `toml:"env,omitempty"`
 	// EnvRemove lists env var keys to remove.
 	EnvRemove []string `toml:"env_remove,omitempty"`
+	// Account overrides the provider's declared account grouping key.
+	Account *string `toml:"account,omitempty"`
+	// AccountMaxActiveSessions overrides the account-wide session cap.
+	AccountMaxActiveSessions *int `toml:"account_max_active_sessions,omitempty" jsonschema:"minimum=0"`
 	// Replace replaces the entire provider block instead of deep-merging.
 	Replace bool `toml:"_replace,omitempty"`
 }
@@ -859,6 +863,12 @@ func applyProviderPatch(cfg *City, patch *ProviderPatch) error {
 		if patch.AcceptStartupDialogs != nil {
 			newSpec.AcceptStartupDialogs = cloneBoolPtr(patch.AcceptStartupDialogs)
 		}
+		if patch.Account != nil {
+			newSpec.Account = *patch.Account
+		}
+		if patch.AccountMaxActiveSessions != nil {
+			newSpec.AccountMaxActiveSessions = copyIntPtr(patch.AccountMaxActiveSessions)
+		}
 		if len(patch.Env) > 0 {
 			newSpec.Env = make(map[string]string, len(patch.Env))
 			for k, v := range patch.Env {
@@ -904,6 +914,12 @@ func applyProviderPatch(cfg *City, patch *ProviderPatch) error {
 	}
 	if patch.AcceptStartupDialogs != nil {
 		spec.AcceptStartupDialogs = cloneBoolPtr(patch.AcceptStartupDialogs)
+	}
+	if patch.Account != nil {
+		spec.Account = *patch.Account
+	}
+	if patch.AccountMaxActiveSessions != nil {
+		spec.AccountMaxActiveSessions = copyIntPtr(patch.AccountMaxActiveSessions)
 	}
 	// Env: additive merge.
 	if len(patch.Env) > 0 {
