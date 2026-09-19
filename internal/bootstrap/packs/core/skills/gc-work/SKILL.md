@@ -16,20 +16,30 @@ gc bd: only supported for bd-backed beads providers (resolved "file" for <scope 
   hint: check city.toml [beads].provider and any per-rig provider overrides.
 ```
 
-(The hint text varies — if `GC_BEADS` is set in the environment you may see
-`GC_BEADS env var overrides the provider. Unset it, or set GC_BEADS=bd for
-this scope.` instead. Either way, the first line — `only supported for
-bd-backed beads providers (resolved "file" for ...)` — is the one to match.)
+(The hint text varies by scope — `bdProviderMismatchHint`
+(`cmd/gc/providers.go`) has three branches. If the scope carries a
+`.gc/beads.json` marker you'll see a hint about that file being stale or the
+scope being genuinely file-backed; if `GC_BEADS` is set in the environment
+you'll see `GC_BEADS env var overrides the provider. Unset it, or set
+GC_BEADS=bd for this scope.`; otherwise you'll see the generic
+`check city.toml [beads].provider ...` hint. Whichever hint you see, the
+first line — `only supported for bd-backed beads providers (resolved "file"
+for ...)` — is the one to match.)
 
 If you hit this, the working directory's resolved provider is `file`, not
-`bd`. Fall back to one of:
+`bd`, and there is no bead write path there. `GC_BEADS=bd` and calling `bd`
+directly do NOT fix this: they satisfy the provider check but route the
+write into whatever store `bd` resolves to on its own, which in a
+file-backed city root is a different live store from the `.gc/beads.json`
+file the city actually schedules from — the write silently lands somewhere
+nothing reads. `gc beads` (note: `beads`, not `bd`) is the read path at a
+file-backed scope, but it has no write verbs (`city`, `health`, `list`,
+`metadata-cas`, `metadata-guarded-clear`, `show` — see `gc beads --help`),
+so there is no `gc`-level bead write in a file-backed root at all.
 
-```
-GC_BEADS=bd gc bd create "title"  # override the provider for this invocation
-```
-
-— or invoke the underlying `bd` binary directly, bypassing `gc`'s provider
-check, for a file-backed scope where neither of the above applies.
+Create, claim, and close work in a bd-backed **rig** scope instead. If you
+need to work at the city root, read with `gc beads list` / `gc beads show`
+and do the actual create/claim/close in the rig the work belongs to.
 
 Everything below this section describes the bd-backed case (rigs), where
 `gc bd` works as documented.
