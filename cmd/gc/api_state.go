@@ -428,6 +428,9 @@ func rigStoreBackgroundRefresh(suspState suspensionstate.State, rig config.Rig) 
 func (cs *controllerState) openRigStore(provider, rigName, rigPath, prefix string, cfg *config.City) beads.Store {
 	scopeRoot := resolveStoreScopeRoot(cs.cityPath, rigPath)
 	openExecStore := func() (beads.Store, error) {
+		if err := validateProviderLifecycleGCBinary(); err != nil {
+			return nil, fmt.Errorf("validate GC_BIN for exec-provider store: %w", err)
+		}
 		s := beadsexec.NewStore(strings.TrimPrefix(provider, "exec:"))
 		env := gcExecStoreEnv(cs.cityPath, execStoreTarget{
 			ScopeRoot: scopeRoot,

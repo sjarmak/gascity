@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/spf13/cobra"
 )
 
@@ -97,7 +98,7 @@ func computePerfStats(walls []int64) perfStats {
 
 // gcBinaryPath returns the path to the running gc binary.
 func gcBinaryPath() (string, error) {
-	path, err := os.Executable()
+	path, err := processenv.ResolveGCBinary()
 	if err != nil {
 		return "", fmt.Errorf("resolving gc binary: %w", err)
 	}

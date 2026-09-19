@@ -19,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/pidutil"
+	"github.com/gastownhall/gascity/internal/processenv"
 )
 
 type managedDoltStartReport struct {
@@ -86,7 +87,7 @@ const (
 
 var (
 	managedDoltTestMode                 = isTestBinary
-	managedDoltTestExecutable           = os.Executable
+	managedDoltTestExecutable           = processenv.ResolveGCBinary
 	managedDoltTestWatchdogPIDTimeout   = 5 * time.Second
 	managedDoltTestProcessRegistry      sync.Map
 	managedDoltTestTerminateProcess     = terminateManagedDoltTestPID
@@ -558,6 +559,13 @@ func startManagedDoltSQLServerWithTestWatchdog(cityPath, configFile, logFilePath
 // managed-dolt watchdog. It serves both the test watchdog and the
 // production scope watchdog (dolt_scope_watchdog.go).
 func managedDoltWatchdogExecutable() (string, error) {
+	if value, configured := os.LookupEnv("GC_BIN"); configured && value != "" {
+		executable, err := processenv.ResolveGCBinary()
+		if err != nil {
+			return "", fmt.Errorf("resolve dolt watchdog executable from GC_BIN: %w", err)
+		}
+		return executable, nil
+	}
 	executable, executableErr := managedDoltTestExecutable()
 	if executableErr == nil && strings.TrimSpace(executable) != "" {
 		return executable, nil

@@ -1716,6 +1716,9 @@ func requireBdBinaryForCity(cityPath string) error {
 // A caller that already holds this city's config passes it to avoid reloading
 // it; a nil config is loaded here.
 func openExecStoreAtForCityWithConfig(provider, scopeRoot, runtimeCityPath string, cfg *config.City) (beads.Store, error) {
+	if err := validateProviderLifecycleGCBinary(); err != nil {
+		return nil, fmt.Errorf("validate GC_BIN for exec-provider store: %w", err)
+	}
 	target, err := resolveConfiguredExecStoreTargetWithConfig(runtimeCityPath, scopeRoot, cfg)
 	if err != nil {
 		return nil, err

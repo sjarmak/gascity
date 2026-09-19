@@ -520,6 +520,24 @@ func TestBuildSupervisorServiceDataTreatsPreserveSignalEnvAsFixed(t *testing.T) 
 	}
 }
 
+func TestBuildSupervisorServiceDataPreservesExplicitPersistentGCBin(t *testing.T) {
+	homeDir := t.TempDir()
+	gcWrapper := filepath.Join(t.TempDir(), "gc wrapper ")
+	if err := os.WriteFile(gcWrapper, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	t.Setenv("GC_BIN", gcWrapper)
+	data, err := buildSupervisorServiceData()
+	if err != nil {
+		t.Fatalf("buildSupervisorServiceData: %v", err)
+	}
+	if data.GCPath != gcWrapper {
+		t.Fatalf("GCPath = %q, want explicit persistent wrapper %q", data.GCPath, gcWrapper)
+	}
+}
+
 // TestBuildSupervisorServiceDataDoesNotPersistLogTeeByDefault pins the
 // install contract for GC_SUPERVISOR_LOG_TEE: gc-generated service files
 // redirect supervisor output into supervisor.log themselves, so the file is

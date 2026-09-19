@@ -25,6 +25,7 @@ import (
 	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/pidutil"
+	"github.com/gastownhall/gascity/internal/processenv"
 )
 
 // providerLifecycleLaunchctlGetenv reads a value from `launchctl getenv` on
@@ -131,13 +132,23 @@ var resolveProviderLifecycleGCBinary = func() string {
 	if isTestBinary() {
 		return ""
 	}
-	if exe, err := os.Executable(); err == nil && exe != "" {
+	if exe, err := processenv.ResolveGCBinary(); err == nil {
 		return exe
 	}
-	if path, err := exec.LookPath("gc"); err == nil && path != "" {
-		return path
-	}
 	return ""
+}
+
+// Validate an explicit override before an environment reaches a
+// shell-backed provider. The legacy string resolver remains a test seam, but
+// production launch admission must not turn an invalid GC_BIN into an omitted
+// variable and a PATH fallback.
+func validateProviderLifecycleGCBinary() error {
+	value, configured := os.LookupEnv("GC_BIN")
+	if !configured || value == "" || isTestBinary() {
+		return nil
+	}
+	_, err := processenv.ResolveGCBinary()
+	return err
 }
 
 var (
@@ -2251,6 +2262,9 @@ func providerLifecycleDoltPathEnv(cityPath string) []string {
 func providerLifecycleProcessEnvWithError(cityPath, provider string) ([]string, error) {
 	if strings.TrimSpace(cityPath) == "" {
 		return nil, nil
+	}
+	if err := validateProviderLifecycleGCBinary(); err != nil {
+		return nil, fmt.Errorf("validate GC_BIN for provider lifecycle: %w", err)
 	}
 	cityPath = normalizePathForCompare(cityPath)
 	env, err := cityRuntimeProcessEnvWithError(cityPath)

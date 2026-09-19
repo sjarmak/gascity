@@ -337,9 +337,11 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		)
 	}
 	agentEnv["GC_BEADS"] = rawBeadsProviderForScope(rigRoot, p.cityPath)
-	if exe, err := os.Executable(); err == nil && exe != "" {
-		agentEnv["GC_BIN"] = exe
+	gcBin, err := processenv.ResolveGCBinary()
+	if err != nil {
+		return TemplateParams{}, fmt.Errorf("agent %q: resolving gc executable: %w", qualifiedName, err)
 	}
+	agentEnv["GC_BIN"] = gcBin
 	sessionBackendEnv, err := sessionBackendEnvWithError(p.cityPath, rigRoot, p.rigs)
 	if err != nil {
 		return TemplateParams{}, fmt.Errorf("agent %q: building session backend env: %w", qualifiedName, err)
