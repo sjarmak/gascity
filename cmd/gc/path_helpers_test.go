@@ -231,9 +231,26 @@ func (g *doltLeakGuardedTestingM) runWith(
 		fmt.Fprintf(os.Stderr, "cmd/gc test dolt leak guard: initial scan failed: %v\n", initialErr) //nolint:errcheck
 	}
 
+	// broadInitial is a host-wide snapshot (no root filter), taken purely for
+	// DETECTION of servers this run's scoped roots (tempRoot/sourceRoot/
+	// checkoutRoot) would otherwise miss -- e.g. a leak into a checkout
+	// subpath the scoped scan doesn't cover, or a future root the scoped
+	// filter hasn't learned about yet. It never widens what gets reaped: a
+	// broad-new process is only ever added to the reap set by
+	// isOwnedNewDoltProcess, which requires its --config path to fall under
+	// this run's own leakRoots(). A broad-new process that fails that check
+	// is reported and left running -- the canonical shared dolt server other
+	// concurrent agents/rigs use on this host must never be touched by this
+	// guard.
+	broadInitial, broadInitialErr := snapshotAllDoltProcesses(enumerate)
+	if broadInitialErr != nil {
+		fmt.Fprintf(os.Stderr, "cmd/gc test dolt leak guard: broad initial scan failed: %v\n", broadInitialErr) //nolint:errcheck
+	}
+
 	code := runTests()
 
 	guardFailed := initialErr != nil
+	reapedPIDs := make(map[int]struct{})
 	if initialErr == nil {
 		leaked, finalErr := g.waitForFinalScanToClear(enumerate, initial, graceInitialInterval, graceMaxElapsedTime)
 		if finalErr != nil {
@@ -244,7 +261,14 @@ func (g *doltLeakGuardedTestingM) runWith(
 			writeDoltLeakReport(os.Stderr, leaked)
 			reapLeaks(leaked)
 			guardFailed = true
+			for _, proc := range leaked {
+				reapedPIDs[proc.PID] = struct{}{}
+			}
 		}
+	}
+
+	if broadInitialErr == nil {
+		g.reportAndReapBroadNewDoltProcesses(enumerate, broadInitial, reapedPIDs, reapLeaks)
 	}
 
 	g.cleanupTemporaryPaths()
@@ -303,6 +327,111 @@ func (g *doltLeakGuardedTestingM) waitForFinalScanToClear(
 	// sentinel error returned by Retry in that case carries no
 	// information beyond "still non-empty".
 	return leaked, nil
+}
+
+// snapshotAllDoltProcesses returns every live dolt sql-server process
+// enumerate() reports, keyed by PID, with no --config root filter applied.
+// It is the host-wide counterpart to snapshotDoltProcessesForConfigRoots and
+// exists solely to widen DETECTION (see runWith's broadInitial comment); the
+// reap decision for anything found only via this snapshot still goes through
+// isOwnedNewDoltProcess.
+func snapshotAllDoltProcesses(enumerate func() ([]DoltProcInfo, error)) (map[int]DoltProcInfo, error) {
+	procs, err := enumerate()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int]DoltProcInfo, len(procs))
+	for _, p := range procs {
+		out[p.PID] = p
+	}
+	return out, nil
+}
+
+// isOwnedNewDoltProcess decides whether a dolt sql-server process that is
+// "new" relative to some baseline (not present under that baseline's key)
+// is this run's to reap. It is the sole gate between broad, host-wide
+// detection and the strict reap allowlist: a process only clears it when
+// BOTH of these hold --
+//
+//  1. It was not already present in beforeSnapshot (by PID). A process that
+//     existed before this run started -- in particular the canonical shared
+//     dolt server other agents/rigs use concurrently on this host -- must
+//     never be reaped by this guard, no matter what its config path is.
+//  2. Its --config path resolves under one of ownedRoots (this run's own
+//     tempRoot/sourceRoot/checkoutRoot, i.e. g.leakRoots()). An empty or
+//     unrecognized config path, or one outside every owned root, means
+//     ownership cannot be positively proven, so it is left alone.
+//
+// "Unrecognized" is never a reap signal on its own -- only positive,
+// provable ownership is. Callers that find a new process failing this check
+// must report it (pid, config path, port if extractable, start time) and
+// leave it running.
+func isOwnedNewDoltProcess(proc DoltProcInfo, beforeSnapshot map[int]DoltProcInfo, ownedRoots []string) bool {
+	if _, existedBefore := beforeSnapshot[proc.PID]; existedBefore {
+		return false
+	}
+	configPath := extractConfigPath(proc.Argv)
+	if configPath == "" {
+		return false
+	}
+	for _, root := range ownedRoots {
+		if root != "" && pathutil.PathWithin(root, configPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// reportAndReapBroadNewDoltProcesses re-scans all dolt sql-server processes
+// on the host (no root filter) and diffs against broadInitial. Any process
+// new relative to that baseline and already reaped via the scoped path
+// (alreadyReaped) is skipped. Of the remainder, isOwnedNewDoltProcess decides
+// reap vs report-only per process; unowned processes are logged with pid,
+// config path, port (if extractable), and start-time ticks, and are never
+// passed to reap.
+func (g *doltLeakGuardedTestingM) reportAndReapBroadNewDoltProcesses(
+	enumerate func() ([]DoltProcInfo, error),
+	broadInitial map[int]DoltProcInfo,
+	alreadyReaped map[int]struct{},
+	reap func([]DoltProcInfo),
+) {
+	broadFinal, err := snapshotAllDoltProcesses(enumerate)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cmd/gc test dolt leak guard: broad final scan failed: %v\n", err) //nolint:errcheck
+		return
+	}
+
+	var owned []DoltProcInfo
+	var unowned []DoltProcInfo
+	for pid, proc := range broadFinal {
+		if _, ok := broadInitial[pid]; ok {
+			continue
+		}
+		if _, ok := alreadyReaped[pid]; ok {
+			continue
+		}
+		if isOwnedNewDoltProcess(proc, broadInitial, g.leakRoots()) {
+			owned = append(owned, proc)
+			continue
+		}
+		unowned = append(unowned, proc)
+	}
+
+	if len(owned) > 0 {
+		sort.Slice(owned, func(i, j int) bool { return owned[i].PID < owned[j].PID })
+		fmt.Fprintf(os.Stderr, "cmd/gc test dolt leak guard: broad scan found %d additional owned dolt sql-server process(es) outside the scoped roots\n", len(owned)) //nolint:errcheck
+		writeDoltLeakReport(os.Stderr, owned)
+		reap(owned)
+	}
+
+	if len(unowned) > 0 {
+		sort.Slice(unowned, func(i, j int) bool { return unowned[i].PID < unowned[j].PID })
+		fmt.Fprintf(os.Stderr, "cmd/gc test dolt leak guard: broad scan found %d new dolt sql-server process(es) NOT attributable to this run; reporting only, NOT reaping (may belong to another concurrent agent/rig on this host)\n", len(unowned)) //nolint:errcheck
+		for _, proc := range unowned {
+			fmt.Fprintf(os.Stderr, "  pid=%d config=%q ports=%v start_ticks=%d argv=%q\n", //nolint:errcheck
+				proc.PID, extractConfigPath(proc.Argv), proc.Ports, proc.StartTimeTicks, strings.Join(proc.Argv, " "))
+		}
+	}
 }
 
 func (g *doltLeakGuardedTestingM) installSignalHandler() func() {

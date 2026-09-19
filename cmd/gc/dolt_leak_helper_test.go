@@ -983,3 +983,113 @@ func TestDoltLeakGuardGraceMaxElapsedTimeBudget(t *testing.T) {
 		t.Fatalf("doltLeakGuardGraceMaxElapsedTime = %s, want >= %s", doltLeakGuardGraceMaxElapsedTime, floor)
 	}
 }
+
+// TestIsOwnedNewDoltProcessNeverReapsSurvivorsOfPreexistingOrUnownedProcesses
+// pins the safety property for the broad, host-wide detection path (ga-4673):
+// widening detection beyond this run's scoped roots must never widen what
+// gets reaped. A process only clears isOwnedNewDoltProcess when it is BOTH
+// new relative to the before-snapshot AND positively attributable to one of
+// this run's own owned roots. Every case here must survive -- i.e. return
+// false -- even though each one is "new" relative to some other baseline, or
+// present at all: a process that predates this run (the canonical shared
+// dolt server other concurrent agents/rigs use is exactly this case), and a
+// process whose --config path sits outside every owned root, must never be
+// in the reap set.
+func TestIsOwnedNewDoltProcessNeverReapsSurvivorsOfPreexistingOrUnownedProcesses(t *testing.T) {
+	ownedRoot := filepath.Join("/tmp", "gct12345-678")
+	sharedServerConfig := filepath.Join("/home", "shared", "citybase", ".gc", "runtime", "packs", "dolt", "dolt-config.yaml")
+	otherAgentConfig := filepath.Join("/home", "other-agent", "rig", ".gc", "runtime", "packs", "dolt", "dolt-config.yaml")
+	ownedConfig := filepath.Join(ownedRoot, "TestX", "001", ".gc", "runtime", "packs", "dolt", "dolt-config.yaml")
+
+	preexisting := DoltProcInfo{
+		PID:  9001,
+		Argv: []string{"dolt", "sql-server", "--config", sharedServerConfig},
+	}
+	beforeSnapshot := map[int]DoltProcInfo{
+		preexisting.PID: preexisting,
+	}
+
+	tests := []struct {
+		name string
+		proc DoltProcInfo
+		want bool
+	}{
+		{
+			// Present in beforeSnapshot at all -- not "new" by definition,
+			// regardless of what its config path says. This is the
+			// canonical shared dolt server's exact shape: it existed before
+			// this run started, so it must never be reaped no matter how
+			// the guard's roots evolve.
+			name: "preexisting pid survives even though its own config looks unrelated",
+			proc: preexisting,
+			want: false,
+		},
+		{
+			// New PID, but its config path is not under any owned root:
+			// "new" alone is never a reap signal. This models another
+			// concurrent agent/rig starting a fresh server on the same host
+			// during this run.
+			name: "new pid with config outside every owned root is report-only",
+			proc: DoltProcInfo{
+				PID:  9002,
+				Argv: []string{"dolt", "sql-server", "--config", otherAgentConfig},
+			},
+			want: false,
+		},
+		{
+			// New PID with no --config flag at all: ownership cannot be
+			// proven, so it must not be reaped.
+			name: "new pid with no config path is report-only",
+			proc: DoltProcInfo{
+				PID:  9003,
+				Argv: []string{"dolt", "sql-server"},
+			},
+			want: false,
+		},
+		{
+			// The positive case, included for contrast: a genuinely new
+			// process whose config path is under this run's own root is the
+			// only shape that may be reaped.
+			name: "new pid with config under an owned root is reapable",
+			proc: DoltProcInfo{
+				PID:  9004,
+				Argv: []string{"dolt", "sql-server", "--config", ownedConfig},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isOwnedNewDoltProcess(tt.proc, beforeSnapshot, []string{ownedRoot})
+			if got != tt.want {
+				t.Fatalf("isOwnedNewDoltProcess(pid=%d) = %v, want %v", tt.proc.PID, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSnapshotAllDoltProcessesIsUnfiltered proves the host-wide snapshot
+// helper backing broad detection returns every process enumerate() reports,
+// with no root filter applied -- the filtering for reap purposes happens
+// later, in isOwnedNewDoltProcess, not here.
+func TestSnapshotAllDoltProcessesIsUnfiltered(t *testing.T) {
+	shared := DoltProcInfo{PID: 7001, Argv: []string{"dolt", "sql-server", "--config", "/home/shared/citybase/dolt-config.yaml"}}
+	owned := DoltProcInfo{PID: 7002, Argv: []string{"dolt", "sql-server", "--config", "/tmp/gct1-1/dolt-config.yaml"}}
+
+	got, err := snapshotAllDoltProcesses(func() ([]DoltProcInfo, error) {
+		return []DoltProcInfo{shared, owned}, nil
+	})
+	if err != nil {
+		t.Fatalf("snapshotAllDoltProcesses: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("snapshotAllDoltProcesses returned %d process(es), want 2 (unfiltered): %#v", len(got), got)
+	}
+	if _, ok := got[shared.PID]; !ok {
+		t.Errorf("unowned shared-server PID %d missing from unfiltered snapshot: %#v", shared.PID, got)
+	}
+	if _, ok := got[owned.PID]; !ok {
+		t.Errorf("owned PID %d missing from unfiltered snapshot: %#v", owned.PID, got)
+	}
+}
