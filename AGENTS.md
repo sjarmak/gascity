@@ -455,19 +455,31 @@ shim already routes the default `GOCACHE` to a shared **on-disk** cache
 (`GOTMPDIR=/var/tmp/gotmp`). A warm shared cache is faster and is never
 corrupted by a normal build.
 
-**Never point `GOCACHE` (or `TMPDIR`) at `/tmp`.** `/tmp` is a size-capped
-RAM-backed tmpfs (61G) shared by the whole fleet — including the harness's
-tool-output capture dir. A bare `mktemp -d` (no `-p` dir) resolves against the
-unset `$TMPDIR`, which defaults to `/tmp` — one cold cache built there is
-2-3GB, and a concurrent build wave fills tmpfs and ENOSPCs every agent
+**Never point `GOCACHE` (or `TMPDIR`) at `/tmp`.** It is shared by the whole
+fleet, including the harness's tool-output capture dir. A bare `mktemp -d` (no
+`-p` dir) resolves against the unset `$TMPDIR`, which defaults to `/tmp` — one
+cold cache built there is 2-3GB, and a concurrent build wave ENOSPCs every agent
 on the host (incident gm-tkz1r / ga-x9k9b9, 2026-07). The shim deliberately
 does **not** relocate a `GOCACHE` you set explicitly, so an explicit `/tmp` path
 defeats it.
 
+**The reason above is no longer "it is a small RAM disk", and using the old
+reason to reassure yourself will get it wrong.** This paragraph used to say
+`/tmp` was a size-capped RAM-backed tmpfs of 61G. Measured 2026-09-19 by
+`gascity-pl`: `findmnt /tmp` returns nothing, because `/tmp` is not a separate
+mount at all — it is a directory on the root xfs filesystem
+(`/dev/nvme1n1p2`, 1.8T, 95% full, 99.4G free), and the only tmpfs mounts on
+the host are `/dev/shm`, `/run` and the per-user `/run/user/*`. So filling
+`/tmp` no longer exhausts RAM; it exhausts the ROOT filesystem, which takes
+down builds, logs, Dolt and every rig at once rather than only the processes
+using tmpfs. The advice is unchanged and the blast radius is larger. Check
+before quoting a number: `findmnt -no SOURCE,FSTYPE,SIZE,AVAIL /tmp /` and
+`df -h /tmp`.
+
 **If you truly need an isolated cold build** (a from-scratch compile without
 `go clean -cache`), put the throwaway cache **on disk** and remove it
 unconditionally with a `trap`, and redirect `TMPDIR` to the same dir so the
-linker's own scratch also stays off tmpfs:
+linker's own scratch lands there too:
 
 ```bash
 tmp=$(mktemp -d -p /var/tmp) && trap 'rm -rf "$tmp"' EXIT
