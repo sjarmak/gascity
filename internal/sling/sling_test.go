@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -214,6 +215,107 @@ func sweepOrphanSlingPIDPrefixedDirs(root, prefix string) {
 			continue
 		}
 		_ = os.RemoveAll(filepath.Join(root, e.Name()))
+	}
+}
+
+// testNonLiveSlingPID is a PID value chosen to sit outside the live PID
+// range on Linux, matching cmd/gc's testNonLivePID convention.
+const testNonLiveSlingPID = 2147483647
+
+func nonLiveSlingPID(t *testing.T) int {
+	t.Helper()
+	if pidutil.Alive(testNonLiveSlingPID) {
+		t.Skipf("test PID %d is unexpectedly alive", testNonLiveSlingPID)
+	}
+	return testNonLiveSlingPID
+}
+
+// TestSweepOrphanSlingPIDPrefixedDirsRoundTrip guards against the exact
+// defect behind gc-g3tgci: a creator whose name the sweeper's parser cannot
+// read. 31,328 directories leaked into /tmp on 2026-09-15 because the
+// on-disk names and slingPIDFromPrefixedDirName's expectations had drifted
+// apart with nothing to catch it. This creates a directory the same way
+// init() does -- os.MkdirTemp with the prefix+pid pattern -- for a PID that
+// is not alive, then asserts the sweeper both parses and removes it. If the
+// creator and the parser ever diverge again, this fails instead of leaking.
+func TestSweepOrphanSlingPIDPrefixedDirsRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	deadPID := nonLiveSlingPID(t)
+
+	dir, err := os.MkdirTemp(root, slingTestFormulaDirPrefix+strconv.Itoa(deadPID)+"-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+
+	parsedPID, ok := slingPIDFromPrefixedDirName(filepath.Base(dir), slingTestFormulaDirPrefix)
+	if !ok || parsedPID != deadPID {
+		t.Fatalf("slingPIDFromPrefixedDirName(%q) = (%d, %v), want (%d, true)", filepath.Base(dir), parsedPID, ok, deadPID)
+	}
+
+	sweepOrphanSlingPIDPrefixedDirs(root, slingTestFormulaDirPrefix)
+
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("sweepOrphanSlingPIDPrefixedDirs did not remove creator-produced dir %q for dead PID %d", dir, deadPID)
+	}
+}
+
+// TestSweepOrphanSlingPIDPrefixedDirsPreservesLivePID asserts the sweep never
+// removes a directory whose owning process is still running.
+func TestSweepOrphanSlingPIDPrefixedDirsPreservesLivePID(t *testing.T) {
+	root := t.TempDir()
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start subprocess: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+
+	dir, err := os.MkdirTemp(root, slingTestCityDirPrefix+strconv.Itoa(cmd.Process.Pid)+"-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+
+	sweepOrphanSlingPIDPrefixedDirs(root, slingTestCityDirPrefix)
+
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		t.Errorf("sweepOrphanSlingPIDPrefixedDirs removed dir for live PID %d", cmd.Process.Pid)
+	}
+}
+
+// TestSweepOrphanSlingPIDPrefixedDirsSkipsSelf asserts the sweep never
+// removes the calling process's own directory, matching init()'s use of the
+// sweep to clean up prior runs' orphans, not its own in-flight fixtures.
+func TestSweepOrphanSlingPIDPrefixedDirsSkipsSelf(t *testing.T) {
+	root := t.TempDir()
+	dir, err := os.MkdirTemp(root, slingPIDPrefixedTempPattern(slingTestFormulaDirPrefix))
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(dir) //nolint:errcheck
+
+	sweepOrphanSlingPIDPrefixedDirs(root, slingTestFormulaDirPrefix)
+
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		t.Errorf("sweepOrphanSlingPIDPrefixedDirs removed its own process's directory %q", dir)
+	}
+}
+
+// TestSweepOrphanSlingPIDPrefixedDirsSkipsLegacyUnprefixedNames documents the
+// known, intentional gap left by gc-g3tgci: directories named without the
+// "pid" token (the shape leaked on disk before this scheme existed) carry no
+// parseable PID, so the sweep leaves them alone rather than guessing. Bulk
+// removal of that residue is a separate, supervised step, not automatic
+// sweep behavior.
+func TestSweepOrphanSlingPIDPrefixedDirsSkipsLegacyUnprefixedNames(t *testing.T) {
+	root := t.TempDir()
+	legacy := filepath.Join(root, "gc-sling-test-formulas-1000031193")
+	if err := os.Mkdir(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	sweepOrphanSlingPIDPrefixedDirs(root, slingTestFormulaDirPrefix)
+
+	if _, err := os.Stat(legacy); os.IsNotExist(err) {
+		t.Errorf("sweepOrphanSlingPIDPrefixedDirs removed legacy-named dir %q it cannot parse a PID from", legacy)
 	}
 }
 
