@@ -107,6 +107,22 @@ Fix one by porting the LATER semantics onto main's current structure. Collapsing
 the refactor back to its pre-split form silences the compiler by reverting the
 earlier PR.
 
+**A clean cherry-pick is not a landing.** Applying cleanly means the patch's
+context still matches; it says nothing about whether the result compiles. A
+commit can pick clean onto `main` and then fail with `undefined:` on a symbol
+that arrives in a sibling commit that does *not* pick clean, which makes the two
+one unit that cannot be landed separately. Measured 2026-09-19 on `a91f9e691a`,
+which needs `executionGraphProjectionStore` and `executionevent.WithStoreRef`
+from `12c4e18d43`. Build every picked commit before you cut a branch for it.
+
+Two things make the probe itself lie. `git cherry-pick -q` is not a flag: it
+exits 129 with a usage message, so a loop reading any non-zero exit as
+"conflict" reports every commit conflicted. And `rerere` is enabled in this
+repo, so an unguarded probe can replay a recorded resolution instead of
+measuring the three-way merge. Probe with
+`git -c rerere.enabled=false cherry-pick <sha>`, and tell exit 1 (a real
+conflict) apart from exit 129 (you mistyped the command).
+
 ## Development approach
 
 **TDD.** Write the test first, watch it fail, make it pass. Every package
