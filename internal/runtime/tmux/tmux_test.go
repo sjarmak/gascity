@@ -2561,10 +2561,14 @@ func TestNudgeSessionSkipsEscapeForCodex(t *testing.T) {
 	defer func() { _ = tm.KillSession(sessionName) }()
 	time.Sleep(300 * time.Millisecond)
 
-	// codex is submit-verify eligible, and the fake pane here is `cat -v`, which
-	// can never show a busy indicator — so ErrNudgeSubmitUnconfirmed is the
-	// correct outcome, exactly as it is for claude below.
-	if err := tm.NudgeSession(sessionName, "hello"); err != nil && !errors.Is(err, ErrNudgeSubmitUnconfirmed) {
+	// codex is submit-verify eligible, and the fake pane here is `cat -v`,
+	// which can never show a busy indicator NOR render a "❯ " composer
+	// prompt at all — it only echoes raw input back. That makes this attempt
+	// genuinely unobservable (case (b): capture succeeds, no composer line
+	// found), not "composer still holds the draft" (ErrNudgeSubmitUnconfirmed
+	// pins the latter, which requires an actual composer line to compare
+	// against). ErrNudgeSubmitComposerUnobservable is the correct outcome.
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil && !errors.Is(err, ErrNudgeSubmitComposerUnobservable) {
 		t.Fatalf("NudgeSession: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -2623,7 +2627,10 @@ func main() {
 	defer func() { _ = tm.KillSession(sessionName) }()
 	time.Sleep(300 * time.Millisecond)
 
-	if err := tm.NudgeSession(sessionName, "hello"); err != nil && !errors.Is(err, ErrNudgeSubmitUnconfirmed) {
+	// The fake codex binary above only echoes stdin (translating Escape to
+	// "^[") and never renders a "❯ " composer prompt, so this is the same
+	// genuinely-unobservable case as the fake codex test above.
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil && !errors.Is(err, ErrNudgeSubmitComposerUnobservable) {
 		t.Fatalf("NudgeSession: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -2680,12 +2687,15 @@ func TestNudgeSessionSkipsEscapeForClaude(t *testing.T) {
 
 	// The "claude" provider is submit-verify-eligible, so NudgeSession waits to
 	// observe a busy indicator before reporting success — but the fake command
-	// here is plain `cat -v`, which can never produce one. That makes
-	// ErrNudgeSubmitUnconfirmed the correct, expected outcome (see
-	// ra-3x46cy/finding 1: NudgeSession must no longer swallow this into a
-	// false "delivered" nil). This test only cares whether Escape was sent
-	// before the paste, which is unaffected by the confirm outcome.
-	if err := tm.NudgeSession(sessionName, "hello"); err != nil && !errors.Is(err, ErrNudgeSubmitUnconfirmed) {
+	// here is plain `cat -v`, which can never produce one, nor does it ever
+	// render a "❯ " composer prompt (see ra-3x46cy/finding 1: NudgeSession
+	// must no longer swallow this into a false "delivered" nil). With no
+	// composer line to compare against, this is the genuinely-unobservable
+	// case, so ErrNudgeSubmitComposerUnobservable is the correct outcome, not
+	// ErrNudgeSubmitUnconfirmed (which pins "checked, and the draft is still
+	// there"). This test only cares whether Escape was sent before the paste,
+	// which is unaffected by the confirm outcome.
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil && !errors.Is(err, ErrNudgeSubmitComposerUnobservable) {
 		t.Fatalf("NudgeSession: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -2929,7 +2939,7 @@ func TestPaneContainsBusyIndicator(t *testing.T) {
 	}
 }
 
-func TestPaneShowsDrainedComposer(t *testing.T) {
+func TestObservePaneComposer(t *testing.T) {
 	longSent := strings.Repeat("x", 50)
 	longSentFirst40 := strings.Repeat("x", 40)
 
@@ -2937,65 +2947,120 @@ func TestPaneShowsDrainedComposer(t *testing.T) {
 		name  string
 		lines []string
 		sent  string
-		want  bool
+		want  composerObservation
 	}{
-		{"nil lines", nil, "hello", false},
-		{"no ready-prompt line observed", []string{"some output", "still no prompt"}, "hello", false},
-		{"bare drained composer", []string{"❯ "}, "hello", true},
-		{"composer still holds exact sent draft", []string{"❯ hello"}, "hello", false},
-		{"composer holds sent draft with trailing padding", []string{"❯ hello  "}, "hello", false},
-		{"composer holds unrelated newer text", []string{"❯ something else entirely"}, "hello", true},
+		{"nil lines", nil, "hello", composerUnobservable},
+		{"no ready-prompt line observed", []string{"some output", "still no prompt"}, "hello", composerUnobservable},
+		{"bare drained composer", []string{"❯ "}, "hello", composerDrained},
+		{"composer still holds exact sent draft", []string{"❯ hello"}, "hello", composerStillDrafted},
+		{"composer holds sent draft with trailing padding", []string{"❯ hello  "}, "hello", composerStillDrafted},
+		{"composer holds unrelated newer text", []string{"❯ something else entirely"}, "hello", composerDrained},
 		{
 			"long draft truncated to pane width still detected via 40-rune compare",
 			[]string{"❯ " + longSentFirst40},
 			longSent,
-			false,
+			composerStillDrafted,
 		},
 		{
 			"long draft's composer drained",
 			[]string{"❯ "},
 			longSent,
-			true,
+			composerDrained,
 		},
 		{
 			"only the LAST ready-prompt line is the live composer: earlier draft, now bare",
 			[]string{"❯ hello", "✻ Worked for 2s", "❯ "},
 			"hello",
-			true,
+			composerDrained,
 		},
 		{
 			"only the LAST ready-prompt line is the live composer: earlier bare, now drafted",
 			[]string{"❯ ", "some noise", "❯ hello"},
 			"hello",
-			false,
+			composerStillDrafted,
 		},
 		{
 			"real captured idle mayor pane: bare composer beneath a done marker",
 			[]string{"✻ Worked for 1m 49s", "", "❯ ", "  bypass permissions on"},
 			"reminder: please respond to the review",
-			true,
+			composerDrained,
 		},
 		{
 			"multiline sent: only its first non-empty line is compared, still drafted",
 			[]string{"❯ first line of reminder"},
 			"\nfirst line of reminder\nsecond line",
-			false,
+			composerStillDrafted,
 		},
 		{
 			"multiline sent: only its first non-empty line is compared, composer drained",
 			[]string{"❯ "},
 			"\nfirst line of reminder\nsecond line",
-			true,
+			composerDrained,
+		},
+		{
+			// Regresses the silent-drop bug (mayor's capture of pane %221
+			// contained a scrollback line "❯ <system-reminder>"). When the
+			// live composer at the bottom of the capture does not itself
+			// match the prompt shape, a deep scrollback line that merely
+			// echoes the prompt glyph must NOT be used as a fallback match:
+			// without composerAnchorWindow bounding the scan, the old
+			// last-textual-match-anywhere algorithm would find this
+			// scrollback line and report composerDrained, which routes a
+			// genuinely undelivered nudge to the never-retried
+			// ErrNudgeSubmitDeliveredUnobserved path -- a silent drop. The
+			// correct answer is composerUnobservable: this attempt could not
+			// tell, so it must not guess "drained".
+			"deep scrollback prompt-shaped line outside the anchor window is not used as a fallback match",
+			append(append([]string{"❯ <system-reminder>"}, make([]string, 20)...), "no composer here", "still no composer"),
+			"hello",
+			composerUnobservable,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := paneShowsDrainedComposer(tt.lines, tt.sent)
+			got := observePaneComposer(tt.lines, tt.sent)
 			if got != tt.want {
-				t.Errorf("paneShowsDrainedComposer(%v, %q) = %v, want %v", tt.lines, tt.sent, got, tt.want)
+				t.Errorf("observePaneComposer(%v, %q) = %v, want %v", tt.lines, tt.sent, got, tt.want)
 			}
 		})
 	}
+}
+
+func TestClassifyUnconfirmedSubmitError(t *testing.T) {
+	t.Run("capture failure yields ErrNudgeSubmitComposerUnobservable, not ErrNudgeSubmitUnconfirmed", func(t *testing.T) {
+		capErr := errors.New("boom: pane gone")
+		err := classifyUnconfirmedSubmitError("sess", nil, capErr, "hello")
+		if !errors.Is(err, ErrNudgeSubmitComposerUnobservable) {
+			t.Fatalf("err = %v, want errors.Is(err, ErrNudgeSubmitComposerUnobservable)", err)
+		}
+		if errors.Is(err, ErrNudgeSubmitUnconfirmed) {
+			t.Fatalf("err = %v, must NOT be ErrNudgeSubmitUnconfirmed (would put an unverifiable capture on the retry path)", err)
+		}
+	})
+
+	t.Run("capture succeeds but no composer line found yields ErrNudgeSubmitComposerUnobservable", func(t *testing.T) {
+		err := classifyUnconfirmedSubmitError("sess", []string{"some output", "still no prompt"}, nil, "hello")
+		if !errors.Is(err, ErrNudgeSubmitComposerUnobservable) {
+			t.Fatalf("err = %v, want errors.Is(err, ErrNudgeSubmitComposerUnobservable)", err)
+		}
+		if errors.Is(err, ErrNudgeSubmitUnconfirmed) {
+			t.Fatalf("err = %v, must NOT be ErrNudgeSubmitUnconfirmed (would put an unobservable composer on the retry path)", err)
+		}
+	})
+
+	t.Run("composer still holds the draft yields ErrNudgeSubmitUnconfirmed and IS retried", func(t *testing.T) {
+		err := classifyUnconfirmedSubmitError("sess", []string{"❯ hello"}, nil, "hello")
+		if !errors.Is(err, ErrNudgeSubmitUnconfirmed) {
+			t.Fatalf("err = %v, want errors.Is(err, ErrNudgeSubmitUnconfirmed) (message really is still unsent)", err)
+		}
+	})
+
+	t.Run("drained composer yields ErrNudgeSubmitDeliveredUnobserved", func(t *testing.T) {
+		err := classifyUnconfirmedSubmitError("sess", []string{"❯ "}, nil, "hello")
+		if !errors.Is(err, ErrNudgeSubmitDeliveredUnobserved) {
+			t.Fatalf("err = %v, want errors.Is(err, ErrNudgeSubmitDeliveredUnobserved)", err)
+		}
+	})
 }
 
 func TestCodexTranscriptTailContainsTurnAborted(t *testing.T) {

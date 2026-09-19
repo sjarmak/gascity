@@ -238,6 +238,20 @@ var (
 	// failure mode (up to 5 copies of one reminder, 1201 occurrences in 5
 	// days of production logs).
 	ErrNudgeSubmitDeliveredUnobserved = errors.New("nudge: submit Enter delivered and composer drained but busy state was never observed")
+	// ErrNudgeSubmitComposerUnobservable indicates the busy-state confirm
+	// failed AND this attempt could not tell whether the submit landed
+	// either: the pane capture itself failed, or the capture succeeded but
+	// held no composer line to read at all. This is a third state distinct
+	// from both ErrNudgeSubmitUnconfirmed (the draft is verifiably still
+	// sitting in the composer) and ErrNudgeSubmitDeliveredUnobserved
+	// (delivery is verifiably proven) -- it means neither was verified.
+	// Callers must NOT retry this the way they retry ErrNudgeSubmitUnconfirmed:
+	// the default here treats an unobservable submit as delivered, which
+	// drops rather than duplicates it. A duplicate costs a stalely-repeated
+	// reminder (ga-civwyz: up to 5 copies, 1201 occurrences in 5 days); a
+	// drop costs one nudge silently going nowhere. The latter is the
+	// accepted trade-off for a state this code cannot resolve on its own.
+	ErrNudgeSubmitComposerUnobservable = errors.New("nudge: submit Enter sent but composer could not be observed (capture failed or no composer line found)")
 	// ErrServerDegraded indicates the tmux server bound to SocketName is
 	// reachable on the filesystem but unresponsive. Creating a new session
 	// in this state would let tmux's own (very short) liveness probe time
@@ -2509,10 +2523,8 @@ func (t *Tmux) nudgeSession(
 			// evidence the Enter reached the pane and the agent consumed it —
 			// only the busy-state OBSERVATION missed it — so that case must be
 			// reported as proven delivery, not requeued as a failure.
-			if lines, capErr := t.CapturePaneLines(target, promptObservationLines); capErr == nil && paneShowsDrainedComposer(lines, message) {
-				return fmt.Errorf("%w: session %q", ErrNudgeSubmitDeliveredUnobserved, session)
-			}
-			return fmt.Errorf("%w: session %q", ErrNudgeSubmitUnconfirmed, session)
+			lines, capErr := t.CapturePaneLines(target, promptObservationLines)
+			return classifyUnconfirmedSubmitError(session, lines, capErr, message)
 		}
 		return nil
 	}
@@ -4148,45 +4160,100 @@ func paneContainsBusyIndicator(lines []string) bool {
 	return false
 }
 
-// paneShowsDrainedComposer reports whether the pane's live composer -- the
-// LAST captured line matching the ready prompt prefix (DefaultReadyPromptPrefix)
-// -- has drained, meaning the submit Enter actually reached the pane and the
-// agent consumed it. Earlier lines that also start with the prompt prefix are
-// scrollback transcript entries, not the live composer, and are ignored.
-//
-// It returns false when the composer still holds sent: the first non-empty
-// line of sent (compared on its first 40 runes, trimmed) is still present in
-// what remains after stripping the prompt prefix. That is the ga-bwm case --
-// the message is sitting drafted-but-unsubmitted -- and callers must keep
-// treating it as unconfirmed and retry. It returns true otherwise: the
-// composer is bare (or holds different, newer text), so the prior submit
-// drained it and only the busy-state OBSERVATION failed. When no line
-// matches the prompt prefix at all, the composer cannot be observed, so this
-// conservatively returns false rather than claiming delivery is proven.
-func paneShowsDrainedComposer(lines []string, sent string) bool {
+// composerObservation is the three-valued read of the pane's live composer
+// after a submit that failed busy-state confirmation. It replaces a bool
+// that collapsed "checked, and the draft is still there" (composerStillDrafted,
+// the only case that is evidence of non-delivery) together with "could not
+// find the composer to check" (composerUnobservable) into a single false.
+type composerObservation int
+
+const (
+	composerStillDrafted composerObservation = iota // sent draft still present: not delivered
+	composerDrained                                 // composer bare or holds newer text: delivery proven
+	composerUnobservable                            // no composer line found in the capture at all
+)
+
+// observePaneComposer reports which composerObservation the capture shows
+// for the message believed sent. It returns composerDrained when the pane's
+// live composer -- the ready-prompt line anchored by lastComposerRemainder --
+// no longer holds sent, meaning the submit Enter actually reached the pane
+// and the agent consumed it: the first non-empty line of sent (compared on
+// its first 40 runes, trimmed) is no longer present in what remains after
+// stripping the prompt prefix. It returns composerStillDrafted when that
+// draft IS still present -- the ga-bwm case, the message sitting
+// drafted-but-unsubmitted -- and callers must keep treating it as unconfirmed
+// and retry. It returns composerUnobservable when no line anchors to the live
+// composer at all, meaning this attempt could not tell either way.
+func observePaneComposer(lines []string, sent string) composerObservation {
 	remainder, observed := lastComposerRemainder(lines, DefaultReadyPromptPrefix)
 	if !observed {
-		return false
+		return composerUnobservable
 	}
 	draft := firstNRunes(strings.TrimSpace(firstNonEmptyLine(sent)), 40)
 	if draft != "" && strings.Contains(remainder, draft) {
-		return false
+		return composerStillDrafted
 	}
-	return true
+	return composerDrained
 }
 
-// lastComposerRemainder returns the text after the ready-prompt prefix on the
-// LAST captured line that matches it -- the live composer, since any earlier
-// match is a scrollback transcript entry -- and whether any line matched at
-// all. Mirrors matchesPromptPrefix's normalization (NBSP folding, box-border
-// stripping) so a line it would call a match also yields a remainder here.
+// classifyUnconfirmedSubmitError turns a capture attempt for an
+// already-sent, busy-state-unconfirmed submit into the correct one of three
+// distinct errors, per the composerObservation states above. Only
+// composerStillDrafted is evidence of non-delivery, so it alone yields
+// ErrNudgeSubmitUnconfirmed, the one case retry-capable callers must requeue.
+// A capture failure (capErr != nil) and composerUnobservable both mean this
+// attempt could not tell, and both yield ErrNudgeSubmitComposerUnobservable;
+// composerDrained means delivery is already proven and yields
+// ErrNudgeSubmitDeliveredUnobserved.
+func classifyUnconfirmedSubmitError(session string, lines []string, capErr error, sent string) error {
+	if capErr != nil {
+		return fmt.Errorf("%w: session %q: %w", ErrNudgeSubmitComposerUnobservable, session, capErr)
+	}
+	switch observePaneComposer(lines, sent) {
+	case composerDrained:
+		return fmt.Errorf("%w: session %q", ErrNudgeSubmitDeliveredUnobserved, session)
+	case composerUnobservable:
+		return fmt.Errorf("%w: session %q", ErrNudgeSubmitComposerUnobservable, session)
+	default: // composerStillDrafted
+		return fmt.Errorf("%w: session %q", ErrNudgeSubmitUnconfirmed, session)
+	}
+}
+
+// composerAnchorWindow bounds how far back from the end of a pane capture
+// lastComposerRemainder will look for the live composer's prompt line. The
+// composer sits at the bottom of the pane together with at most a couple of
+// status/footer lines -- a "Worked for Ns" spinner above it, a
+// permissions-mode footer below it, plus tmux's own blank padding -- all
+// within a handful of lines of the bottom. Scanning the entire capture for
+// the last TEXTUAL match (the prior behavior) let scrollback transcript
+// content that merely started with the prompt glyph, such as an echoed
+// "\u276f <system-reminder>" line observed many lines further back, win the match
+// over the live composer beneath it -- producing a false "drained" verdict
+// that routed a genuinely undelivered nudge to the never-retried
+// ErrNudgeSubmitDeliveredUnobserved path (silent drop). Bounding the scan to
+// the bottom of the capture keeps deep scrollback out of reach: a composer
+// line that doesn't appear within this window is reported unobservable, not
+// guessed as drained.
+const composerAnchorWindow = 6
+
+// lastComposerRemainder returns the text after the ready-prompt prefix on
+// the LAST line, within composerAnchorWindow lines of the end of the
+// capture, that matches it -- the live composer -- and whether any line in
+// that window matched at all. Mirrors matchesPromptPrefix's normalization
+// (NBSP folding, box-border stripping) so a line it would call a match also
+// yields a remainder here.
 func lastComposerRemainder(lines []string, readyPromptPrefix string) (string, bool) {
 	normalizedPrefix := strings.ReplaceAll(readyPromptPrefix, "\u00a0", " ")
 	prefixTrimmed := strings.TrimSpace(normalizedPrefix)
 
+	start := 0
+	if len(lines) > composerAnchorWindow {
+		start = len(lines) - composerAnchorWindow
+	}
+
 	var remainder string
 	var observed bool
-	for _, line := range lines {
+	for _, line := range lines[start:] {
 		trimmed := strings.TrimSpace(strings.ReplaceAll(line, "\u00a0", " "))
 		for _, cand := range []string{trimmed, stripLeadingBoxBorder(trimmed)} {
 			switch {

@@ -134,9 +134,14 @@ func TestNudgeSessionReEntersUntilSubmittedForClaude(t *testing.T) {
 // the confirmed bool from submitEnterAndConfirm and reported nil ("clean
 // delivery") even when the agent's busy indicator was never observed within
 // budget — the exact condition that let a drafted-but-unsubmitted nudge go
-// undetected for 15+ minutes. NudgeSession must now surface
-// ErrNudgeSubmitUnconfirmed instead, so a retry-capable caller (the queue
-// dispatcher) does not ack the item.
+// undetected for 15+ minutes. NudgeSession must now surface a non-nil error
+// instead, so a retry-capable caller (the queue dispatcher) does not ack the
+// item blind. The specific error is ErrNudgeSubmitComposerUnobservable, not
+// ErrNudgeSubmitUnconfirmed: buildBusyOnEnterBinary's fake pane only echoes
+// stdin and a busy footer, it never renders a "❯ " composer prompt, so there
+// is no composer line here to compare the draft against -- this attempt
+// could not tell whether the submit landed, which is the unobservable case,
+// not "checked, and the draft is still there."
 func TestNudgeSessionReturnsUnconfirmedErrorWhenNeverBusyForClaude(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
@@ -160,9 +165,9 @@ func TestNudgeSessionReturnsUnconfirmedErrorWhenNeverBusyForClaude(t *testing.T)
 
 	err := tm.NudgeSession(sessionName, "hello-unconfirmed")
 	if err == nil {
-		t.Fatal("NudgeSession err = nil, want ErrNudgeSubmitUnconfirmed (an unconfirmed submit must not report clean delivery)")
+		t.Fatal("NudgeSession err = nil, want a non-nil error (an unconfirmed submit must not report clean delivery)")
 	}
-	if !errors.Is(err, ErrNudgeSubmitUnconfirmed) {
-		t.Fatalf("err = %v, want errors.Is(err, ErrNudgeSubmitUnconfirmed)", err)
+	if !errors.Is(err, ErrNudgeSubmitComposerUnobservable) {
+		t.Fatalf("err = %v, want errors.Is(err, ErrNudgeSubmitComposerUnobservable)", err)
 	}
 }

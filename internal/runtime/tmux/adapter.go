@@ -1565,9 +1565,14 @@ func launchOrchestration(ctx context.Context, ops startOps, name string, cfg run
 			// failure case for a different reason: the ladder above already
 			// refuses to retry it (retrying would re-inject a message the
 			// session already received), so by the time it reaches here
-			// delivery is proven and only the observation missed it. Any
+			// delivery is proven and only the observation missed it. A
+			// submit whose composer could not even be checked
+			// (ErrNudgeSubmitComposerUnobservable) is the same warning-not-
+			// failure case again: this attempt could not tell either way,
+			// and failing startup over an inconclusive check would be worse
+			// than the accepted cost of possibly missing this one nudge. Any
 			// other error still fails the start.
-			if !errors.Is(err, ErrNudgeSubmitUnconfirmed) && !errors.Is(err, ErrNudgeSubmitDeliveredUnobserved) {
+			if !errors.Is(err, ErrNudgeSubmitUnconfirmed) && !errors.Is(err, ErrNudgeSubmitDeliveredUnobserved) && !errors.Is(err, ErrNudgeSubmitComposerUnobservable) {
 				return fmt.Errorf("sending startup nudge: %w", err)
 			}
 			// The stderr warning alone is not a durable record (Layer 0
