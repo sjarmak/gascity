@@ -437,29 +437,18 @@ func TestNudgeEventDispatcherEmptyQueueSkipsObservation(t *testing.T) {
 	}
 }
 
-// TestNudgeEventDispatcherRunPassClosesEveryStoreItOpens pins the connection-leak
-// fix in runPass: every targeted-event, resync, wake and patrol pass opens a bead
-// store via openNudgeBeadStoreWithModeErr but never released it via closeBeadStoreHandle,
-// so a long-lived dispatcher accumulated open store handles across passes (PR
-// #4967 ship-gate finding 5). Each pass here must close what it opened.
 func TestNudgeEventDispatcherRunPassClosesEveryStoreItOpens(t *testing.T) {
-	// Install the seam before fixture setup: newNudgeDispatcherFixture's dispatcher
-	// starts a worker goroutine immediately, so swapping the package-level
-	// openNudgeBeadStoreWithModeErr var after that point races against its reads.
-	// This mode-aware seam is used only by runPass; the fixture's long-lived
-	// session-manager store continues through openNudgeBeadStoreErr and does not
-	// enter these counters.
 	var opens, closes atomic.Int64
-	prev := openNudgeBeadStoreWithModeErr
-	openNudgeBeadStoreWithModeErr = func(path string, _ gate.Mode) (beads.NudgesStore, error) {
+	prev := openNudgeBeadStoreWithModeOwned
+	openNudgeBeadStoreWithModeOwned = func(path string, _ gate.Mode) (beads.NudgesStore, beads.Store, error) {
 		opens.Add(1)
-		store, err := prev(path, gate.ModeUnset)
+		store, opened, err := prev(path, gate.ModeUnset)
 		if err != nil {
-			return store, err
+			return store, opened, err
 		}
-		return beads.NudgesStore{Store: &runPassCloseCountingStore{Store: store.Store, closes: &closes}}, nil
+		return store, &runPassCloseCountingStore{Store: opened, closes: &closes}, nil
 	}
-	t.Cleanup(func() { openNudgeBeadStoreWithModeErr = prev })
+	t.Cleanup(func() { openNudgeBeadStoreWithModeOwned = prev })
 
 	fake := newNudgeEventedFake()
 	dir, d, info := newNudgeDispatcherFixture(t, fake)
@@ -523,12 +512,13 @@ func TestNudgeEventDispatcherRunPassUsesBootLatchedConditionalWritesMode(t *test
 	}
 
 	var openedWith gate.Mode
-	previousOpen := openNudgeBeadStoreWithModeErr
-	openNudgeBeadStoreWithModeErr = func(_ string, mode gate.Mode) (beads.NudgesStore, error) {
+	previousOpen := openNudgeBeadStoreWithModeOwned
+	openNudgeBeadStoreWithModeOwned = func(_ string, mode gate.Mode) (beads.NudgesStore, beads.Store, error) {
 		openedWith = mode
-		return beads.NudgesStore{Store: beads.NewMemStore()}, nil
+		store := beads.NewMemStore()
+		return beads.NudgesStore{Store: store}, store, nil
 	}
-	t.Cleanup(func() { openNudgeBeadStoreWithModeErr = previousOpen })
+	t.Cleanup(func() { openNudgeBeadStoreWithModeOwned = previousOpen })
 
 	d := &nudgeEventDispatcher{
 		cityPath:              cityPath,
@@ -826,11 +816,7 @@ func writeCityRuntimeConfigWithDaemonMode(t *testing.T, tomlPath, provider, nudg
 // (*nudgeEventDispatcher).runPass itself -- not a hand-rolled simulation of
 // its open/close sequence -- against a city whose nudges class is relocated
 // onto a shared binding, across two passes, the way the worker loop actually
-// calls it (nudge_event_dispatcher.go:290/293). A mutant that closes
-// unconditionally (`if nudgeBeadStoreOwned(...)` -> `if true`) must fail
-// this: TestNudgeEventDispatcherRunPassClosesBeadStore only replays the same
-// open/close decision inline without calling runPass, so it cannot catch a
-// regression in runPass's own wiring of that guard.
+// calls it (nudge_event_dispatcher.go:290/293).
 func TestNudgeEventDispatcherRunPassPreservesRelocatedStoreAcrossPasses(t *testing.T) {
 	cityPath := t.TempDir()
 	entry := cliStorageRoutesEntryFor(cityPath)

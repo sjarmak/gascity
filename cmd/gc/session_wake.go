@@ -224,11 +224,54 @@ const executionStalledDrainReason = "execution-stalled"
 
 func drainReasonCancelable(reason string) bool {
 	return reason != "config-drift" && reason != "orphaned" && reason != "suspended" &&
-		reason != executionStalledDrainReason
+		reason != executionStalledDrainReason && reason != idleRespawnDrainReason
 }
 
 func pendingDrainReasonCancelable(reason string) bool {
 	return reason != "orphaned" && reason != "suspended" && reason != executionStalledDrainReason
+}
+
+// liveClaimDrainReasonCancelable is the live-claim cancel lens: the in-flight
+// drain reasons that a live claim held by the session (sessionOwnsLiveClaim)
+// may cancel. Only "orphaned": it is a demand-class verdict that a one-tick
+// stale view (an out-of-process claim the cache has not seen) can produce, so
+// it must be revisable once the claim is visible. Every other non-cancelable
+// reason is operator or agent intent (suspended, config-drift,
+// execution-stalled, idle-respawn) and stays final; the caller additionally
+// requires liveClaimVetoApplies, so an orphaned drain of a removed or
+// suspended agent is never canceled either.
+func liveClaimDrainReasonCancelable(reason string) bool {
+	return reason == "orphaned"
+}
+
+// orphanedDrainInFlightInfo reports whether the session has a reconciler-owned
+// "orphaned" drain in flight, either tracked in memory or recovered from the
+// runtime's reconciler drain-ack metadata (e.g. after a controller restart).
+// Agent-sourced drain acks are never reported: those are the agent's intent.
+func orphanedDrainInFlightInfo(info sessions.Info, sp runtime.Provider, dt *drainTracker, name string) bool {
+	if dt != nil {
+		if ds := dt.get(info.ID); ds != nil && liveClaimDrainReasonCancelable(ds.reason) {
+			return true
+		}
+	}
+	reason, ok := reconcilerDrainAckMatchesSessionInfo(info, sp, name)
+	return ok && liveClaimDrainReasonCancelable(reason)
+}
+
+// cancelOrphanedDrainForLiveClaimInfo cancels an in-flight reconciler-owned
+// "orphaned" drain — the tracked drain and/or its published drain ack — once the
+// session is known to hold a live claim. It reports whether anything was
+// canceled.
+func cancelOrphanedDrainForLiveClaimInfo(info sessions.Info, sp runtime.Provider, dt *drainTracker, name string) bool {
+	canceled := dt != nil && cancelSessionDrainIfInfo(info, sp, dt, liveClaimDrainReasonCancelable)
+	if reason, ok := reconcilerDrainAckMatchesSessionInfo(info, sp, name); ok && liveClaimDrainReasonCancelable(reason) {
+		_ = clearReconcilerDrainAckMetadata(sp, name)
+		if !canceled {
+			telemetry.RecordDrainTransition(context.Background(), name, reason, "cancel")
+		}
+		canceled = true
+	}
+	return canceled
 }
 
 const (
@@ -597,6 +640,32 @@ func advanceSessionDrainsWithSessionsTraced(
 				})
 			}
 			continue
+		}
+
+		// Idle-respawn is a recovery action, not permission to interrupt a
+		// session that resumed work after the probe completed. Revalidate both
+		// the assigned-work premise and runtime activity immediately before the
+		// reconciler publishes its drain acknowledgement. Observation failures
+		// fail closed and leave the session running.
+		if ds.reason == idleRespawnDrainReason {
+			eval, exists := wakeEvals[info.ID]
+			lastActivity, activityErr := workerSessionTargetLastActivityWithConfig("", store, sp, cfg, name)
+			if !exists || !idleRespawnEligible(info, eval, clk.Now()) || activityErr != nil || lastActivity.After(ds.startedAt) {
+				dt.clearIdleProbe(id)
+				if ds.ackSet {
+					_ = clearReconcilerDrainAckMetadata(sp, name)
+				}
+				dt.remove(id)
+				telemetry.RecordDrainTransition(context.Background(), name, ds.reason, "cancel")
+				if trace != nil {
+					fields := traceRecordPayload{"activity_resumed": lastActivity.After(ds.startedAt)}
+					if activityErr != nil {
+						fields["activity_error"] = activityErr.Error()
+					}
+					trace.RecordDecision(TraceSiteDrainCancel, TraceReasonCode(ds.reason), TraceOutcomeCancel, normalizedSessionTemplateInfo(info, cfg), name, fields)
+				}
+				continue
+			}
 		}
 
 		if eval, ok := wakeEvals[info.ID]; ok &&

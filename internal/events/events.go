@@ -94,15 +94,6 @@ const (
 	// LIVENESS fact, not a graph execution fact — nothing about the step's
 	// topology is asserted, and no projector consumes it.
 	ExecutionStepStalled = "execution.step_stalled"
-	// ExecutionClaimStalled records that a seat had its OWN ready work sitting
-	// open and unclaimed while it was awake and quiet, past the bounded nudges
-	// the controller's claim backstop spent on it. It is the never-claimed
-	// counterpart of ExecutionStepStalled's never-executed claim, and the
-	// remedies differ: nothing here is stranded in_progress, so no drain
-	// follows and the backstop keeps re-nudging. Subject carries the unclaimed
-	// bead, RunID the workflow root, SessionID the seat. A controller LIVENESS
-	// fact, not a graph execution fact; no projector consumes it.
-	ExecutionClaimStalled = "execution.claim_stalled"
 	// BeadDeadAssigneeReopened fires when the reconciler reopens a routed work
 	// bead whose assignee resolves to no open session bead — the owning session
 	// closed/retired while the bead stayed assigned, leaving it open+routed but
@@ -180,6 +171,18 @@ const (
 	// the reconciler-detected leak so pack-level subscribers can decide
 	// whether to clear-assignee-and-respawn or escalate.
 	SessionStranded = "session.stranded"
+	// SessionPoolSlotRetiredAtDrainDeadline fires when the reconciler force-
+	// retires a pool-managed session bead that entered drain and never
+	// finalized its drain-ack, once the drain has outlived the retire
+	// deadline, the seat holds no assigned work, and its runtime is
+	// confirmed stopped. The bead close frees the runtime name the pool slot
+	// is pinned to, so the pool can mint the seat again.
+	//
+	// It is a symptom bound, not a cure: every emission is a drain-ack that
+	// never resolved. Count it — a rising rate means the underlying
+	// drain-ack defect is spreading while this bound quietly absorbs it.
+	// See ga-rxhu2.
+	SessionPoolSlotRetiredAtDrainDeadline = "session.pool_slot_retired_at_drain_deadline"
 	// SessionUnknownState fires when the reconciler observes a session bead
 	// whose metadata state it does not recognize. The reconciler skips such
 	// beads (forward-compatible rollback: an older reconciler ignores a newer
@@ -460,6 +463,7 @@ var KnownEventTypes = []string{
 	SessionDrainAckedWithAssignedWork,
 	SessionDrainStopEscalated,
 	SessionStranded,
+	SessionPoolSlotRetiredAtDrainDeadline,
 	SessionUnknownState,
 	SessionWakeRefused,
 	SessionResetStalled,
@@ -475,7 +479,6 @@ var KnownEventTypes = []string{
 	ExecutionWorkAssociated, ExecutionRunAnchored, ExecutionStepDefined, ExecutionStepStarted, ExecutionStepCompleted,
 	ExecutionClaimWindowExpired,
 	ExecutionStepStalled,
-	ExecutionClaimStalled,
 	MailSent, MailRead, MailArchived, MailMarkedRead, MailMarkedUnread,
 	MailReplied, MailDeleted,
 	ConvoyCreated, ConvoyClosed,
