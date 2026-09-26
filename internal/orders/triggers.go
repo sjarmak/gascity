@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -76,6 +77,7 @@ type boundedTailWriter struct {
 	buf     []byte
 	limit   int
 	dropped bool
+	written int
 }
 
 func newBoundedTailWriter(limit int) *boundedTailWriter {
@@ -84,6 +86,7 @@ func newBoundedTailWriter(limit int) *boundedTailWriter {
 
 func (w *boundedTailWriter) Write(p []byte) (int, error) {
 	n := len(p)
+	w.written += n
 	if len(w.buf)+n > w.limit {
 		w.dropped = true
 	}
@@ -351,12 +354,17 @@ func checkCondition(a Order, opts TriggerOptions) TriggerResult {
 	cleanupCommand := prepareConditionCommand(cmd, conditionCheckSignalGrace)
 	cmd.WaitDelay = conditionCheckPostCancelWaitDelay
 	cmd.Stdout = io.Discard
-	stderrTail := newBoundedTailWriter(conditionCheckStderrTailBytes)
+	cmd.Env = mergeConditionEnv(os.Environ(), opts.ConditionEnv)
+	secrets := conditionCheckSensitiveValues(cmd.Env)
+	captureBytes := conditionCheckStderrTailBytes
+	if len(secrets) > 0 {
+		captureBytes += len(secrets[0])
+	}
+	stderrTail := newBoundedTailWriter(captureBytes)
 	cmd.Stderr = stderrTail
 	if opts.ConditionDir != "" {
 		cmd.Dir = opts.ConditionDir
 	}
-	cmd.Env = mergeConditionEnv(os.Environ(), opts.ConditionEnv)
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			reason := fmt.Sprintf("check command %s after %s", ConditionCheckTimedOutMarker, timeout)
@@ -372,7 +380,13 @@ func checkCondition(a Order, opts TriggerOptions) TriggerResult {
 			}
 			return TriggerResult{Due: false, Reason: reason}
 		}
-		excerpt := conditionCheckStderrExcerpt(stderrTail.String(), stderrTail.dropped, cmd.Env)
+		excerpt := conditionCheckStderrExcerpt(
+			stderrTail.String(),
+			stderrTail.dropped,
+			stderrTail.written > conditionCheckStderrTailBytes,
+			cmd.Env,
+			secrets,
+		)
 		var exitErr *exec.ExitError
 		if excerpt == "" && ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.Exited() {
 			return TriggerResult{Due: false, Reason: fmt.Sprintf("condition: not met (exit %d)", exitErr.ExitCode())}
@@ -386,15 +400,25 @@ func checkCondition(a Order, opts TriggerOptions) TriggerResult {
 	return TriggerResult{Due: true, Reason: "condition: check passed (exit 0)"}
 }
 
-func conditionCheckStderrExcerpt(stderr string, dropped bool, env []string) string {
-	if dropped {
-		if newline := strings.IndexByte(stderr, '\n'); newline >= 0 {
-			stderr = stderr[newline+1:]
-		} else {
-			stderr = ""
+func conditionCheckStderrExcerpt(stderr string, captureDropped, overLimit bool, env, secrets []string) string {
+	excerpt := execenv.RedactText(stderr, env)
+	for _, secret := range secrets {
+		if len(secret) < 4 {
+			excerpt = strings.ReplaceAll(excerpt, secret, execenv.Redacted)
 		}
 	}
-	excerpt := execenv.RedactText(stderr, env)
+	partialLine := captureDropped
+	if len(excerpt) > conditionCheckStderrTailBytes {
+		excerpt = excerpt[len(excerpt)-conditionCheckStderrTailBytes:]
+		partialLine = true
+	}
+	if partialLine {
+		if newline := strings.IndexByte(excerpt, '\n'); newline >= 0 {
+			excerpt = excerpt[newline+1:]
+		} else {
+			excerpt = ""
+		}
+	}
 	excerpt = strings.Map(func(r rune) rune {
 		if !unicode.IsPrint(r) {
 			return ' '
@@ -402,17 +426,38 @@ func conditionCheckStderrExcerpt(stderr string, dropped bool, env []string) stri
 		return r
 	}, excerpt)
 	excerpt = strings.TrimSpace(excerpt)
-	if excerpt == "" && !dropped {
+	if excerpt == "" && !overLimit {
 		return ""
 	}
 	runes := []rune(excerpt)
-	if !dropped && len(runes) <= conditionCheckStderrExcerptRunes {
+	if !overLimit && len(runes) <= conditionCheckStderrExcerptRunes {
 		return excerpt
 	}
 	if keep := conditionCheckStderrExcerptRunes - 1; len(runes) > keep {
 		runes = runes[len(runes)-keep:]
 	}
 	return "…" + string(runes)
+}
+
+func conditionCheckSensitiveValues(env []string) []string {
+	seen := map[string]struct{}{}
+	values := make([]string, 0)
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		value = strings.TrimSpace(value)
+		if !ok || value == "" || !execenv.IsSensitiveKey(key) {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+	sort.Slice(values, func(i, j int) bool {
+		return len(values[i]) > len(values[j])
+	})
+	return values
 }
 
 func mergeConditionEnv(environ, extra []string) []string {

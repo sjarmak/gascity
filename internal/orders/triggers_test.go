@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/execenv"
 	"github.com/gastownhall/gascity/internal/processgroup/processgrouptest"
 )
 
@@ -323,14 +324,14 @@ func TestCheckTriggerConditionFailureBoundsStderrTail(t *testing.T) {
 	}
 }
 
-func TestCheckTriggerConditionFailureDropsPartialSecretLine(t *testing.T) {
+func TestCheckTriggerConditionFailureRedactsPartialSecretLine(t *testing.T) {
 	const secret = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-_"
 	check := `head -c 5000 /dev/zero | tr '\000' x >&2; printf '\n%s' "$ORDER_API_TOKEN" >&2; printf '%4070s' '' >&2; exit 1`
 	result := checkCondition(Order{Check: check}, TriggerOptions{
 		ConditionEnv: []string{"ORDER_API_TOKEN=" + secret},
 	})
 
-	const want = "check command failed: exit status 1: stderr: …"
+	const want = "check command failed: exit status 1: stderr: …[redacted]"
 	if result.Reason != want {
 		t.Fatalf("Reason = %q, want %q", result.Reason, want)
 	}
@@ -413,6 +414,34 @@ func TestCheckTriggerConditionFailureRedactsSensitiveEnvironment(t *testing.T) {
 		t.Fatalf("Reason leaked sensitive environment value: %q", result.Reason)
 	}
 	if !strings.Contains(result.Reason, "[redacted]") {
+		t.Fatalf("Reason = %q, want redaction marker", result.Reason)
+	}
+}
+
+func TestCheckTriggerConditionFailureRedactsMultilineSecretAcrossTailBoundary(t *testing.T) {
+	const secret = "ABCDE\nleaked-secret-suffix"
+	result := checkCondition(Order{
+		Check: `printf '%s' "$ORDER_API_TOKEN" >&2; printf '%4075s' '' >&2; exit 1`,
+	}, TriggerOptions{ConditionEnv: []string{"ORDER_API_TOKEN=" + secret}})
+
+	if strings.Contains(result.Reason, "leaked-secret-suffix") {
+		t.Fatalf("Reason leaked sensitive environment suffix: %q", result.Reason)
+	}
+	if !strings.Contains(result.Reason, execenv.Redacted) {
+		t.Fatalf("Reason = %q, want redaction marker", result.Reason)
+	}
+}
+
+func TestCheckTriggerConditionFailureRedactsShortSensitiveEnvironment(t *testing.T) {
+	const secret = "abc"
+	result := checkCondition(Order{
+		Check: `printf '%s' "$ORDER_API_TOKEN" >&2; exit 1`,
+	}, TriggerOptions{ConditionEnv: []string{"ORDER_API_TOKEN=" + secret}})
+
+	if strings.Contains(result.Reason, secret) {
+		t.Fatalf("Reason leaked short sensitive environment value: %q", result.Reason)
+	}
+	if !strings.Contains(result.Reason, execenv.Redacted) {
 		t.Fatalf("Reason = %q, want redaction marker", result.Reason)
 	}
 }
