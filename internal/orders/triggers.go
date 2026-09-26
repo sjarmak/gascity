@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/execenv"
@@ -21,7 +22,8 @@ type TriggerResult struct {
 	// Due is true if the trigger condition is satisfied and the order should run.
 	Due bool
 	// Reason explains why the trigger is or isn't due.
-	Reason string
+	Reason   string
+	TimedOut bool
 	// LastRun is the last execution time (zero if never run).
 	LastRun time.Time
 }
@@ -64,6 +66,43 @@ var (
 // consumer in the dispatcher reference this one constant instead of coupling
 // on a separately-typed literal across packages.
 const ConditionCheckTimedOutMarker = "timed out"
+
+const (
+	conditionCheckStderrTailBytes    = 4096
+	conditionCheckStderrExcerptRunes = 300
+)
+
+type boundedTailWriter struct {
+	buf     []byte
+	limit   int
+	dropped bool
+}
+
+func newBoundedTailWriter(limit int) *boundedTailWriter {
+	return &boundedTailWriter{buf: make([]byte, 0, limit), limit: limit}
+}
+
+func (w *boundedTailWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	if len(w.buf)+n > w.limit {
+		w.dropped = true
+	}
+	if n >= w.limit {
+		w.buf = w.buf[:w.limit]
+		copy(w.buf, p[n-w.limit:])
+		return n, nil
+	}
+	if overflow := len(w.buf) + n - w.limit; overflow > 0 {
+		copy(w.buf, w.buf[overflow:])
+		w.buf = w.buf[:len(w.buf)-overflow]
+	}
+	w.buf = append(w.buf, p...)
+	return n, nil
+}
+
+func (w *boundedTailWriter) String() string {
+	return string(w.buf)
+}
 
 // CheckTrigger evaluates an order's trigger condition and returns whether it's due.
 // ep is an events Provider used by event triggers to query events; may be nil for
@@ -312,7 +351,8 @@ func checkCondition(a Order, opts TriggerOptions) TriggerResult {
 	cleanupCommand := prepareConditionCommand(cmd, conditionCheckSignalGrace)
 	cmd.WaitDelay = conditionCheckPostCancelWaitDelay
 	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	stderrTail := newBoundedTailWriter(conditionCheckStderrTailBytes)
+	cmd.Stderr = stderrTail
 	if opts.ConditionDir != "" {
 		cmd.Dir = opts.ConditionDir
 	}
@@ -323,7 +363,7 @@ func checkCondition(a Order, opts TriggerOptions) TriggerResult {
 			if cleanupErr := cleanupCommand(); cleanupErr != nil {
 				reason = fmt.Sprintf("%s; cleanup failed: %v", reason, cleanupErr)
 			}
-			return TriggerResult{Due: false, Reason: reason}
+			return TriggerResult{Due: false, Reason: reason, TimedOut: true}
 		}
 		if errors.Is(err, exec.ErrWaitDelay) {
 			reason := "check command cleanup exceeded post-cancel wait delay"
@@ -332,20 +372,47 @@ func checkCondition(a Order, opts TriggerOptions) TriggerResult {
 			}
 			return TriggerResult{Due: false, Reason: reason}
 		}
-		// A non-zero exit is the condition-probe contract, but *exec.ExitError
-		// also covers processes we killed and processes something else killed.
-		// Both predicates are load-bearing and neither subsumes the other:
-		// ctx.Err() == nil rules out our own cancel/deadline (on Windows a
-		// canceled check is Kill()ed and reports a clean-looking exit 1), and
-		// Exited() rules out a signal death we did not cause (OOM killer,
-		// external SIGKILL), where ExitCode() is a meaningless -1.
+		excerpt := conditionCheckStderrExcerpt(stderrTail.String(), stderrTail.dropped, cmd.Env)
 		var exitErr *exec.ExitError
-		if ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.Exited() {
+		if excerpt == "" && ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.Exited() {
 			return TriggerResult{Due: false, Reason: fmt.Sprintf("condition: not met (exit %d)", exitErr.ExitCode())}
 		}
-		return TriggerResult{Due: false, Reason: fmt.Sprintf("check command failed: %v", err)}
+		reason := fmt.Sprintf("check command failed: %v", err)
+		if excerpt != "" {
+			reason += ": stderr: " + excerpt
+		}
+		return TriggerResult{Due: false, Reason: reason}
 	}
 	return TriggerResult{Due: true, Reason: "condition: check passed (exit 0)"}
+}
+
+func conditionCheckStderrExcerpt(stderr string, dropped bool, env []string) string {
+	if dropped {
+		if newline := strings.IndexByte(stderr, '\n'); newline >= 0 {
+			stderr = stderr[newline+1:]
+		} else {
+			stderr = ""
+		}
+	}
+	excerpt := execenv.RedactText(stderr, env)
+	excerpt = strings.Map(func(r rune) rune {
+		if !unicode.IsPrint(r) {
+			return ' '
+		}
+		return r
+	}, excerpt)
+	excerpt = strings.TrimSpace(excerpt)
+	if excerpt == "" && !dropped {
+		return ""
+	}
+	runes := []rune(excerpt)
+	if !dropped && len(runes) <= conditionCheckStderrExcerptRunes {
+		return excerpt
+	}
+	if keep := conditionCheckStderrExcerptRunes - 1; len(runes) > keep {
+		runes = runes[len(runes)-keep:]
+	}
+	return "…" + string(runes)
 }
 
 func mergeConditionEnv(environ, extra []string) []string {
